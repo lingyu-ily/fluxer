@@ -65,6 +65,12 @@ const NAMED_FLUXER_ENV_OVERRIDES: Record<string, NamedEnvOverride> = {
 	FLUXER_S3_BUCKET_REPORTS: {path: ['s3', 'buckets', 'reports']},
 	FLUXER_S3_BUCKET_HARVESTS: {path: ['s3', 'buckets', 'harvests']},
 	FLUXER_S3_BUCKET_STATIC: {path: ['s3', 'buckets', 'static']},
+	FLUXER_S3_DOWNLOADS_ENDPOINT: {path: ['s3_downloads', 'endpoint']},
+	FLUXER_S3_DOWNLOADS_PUBLIC_ENDPOINT: {path: ['s3_downloads', 'presigned_url_base']},
+	FLUXER_S3_DOWNLOADS_FORCE_PATH_STYLE: {path: ['s3_downloads', 'force_path_style'], parse: parseEnvValue},
+	FLUXER_S3_DOWNLOADS_REGION: {path: ['s3_downloads', 'region']},
+	FLUXER_S3_DOWNLOADS_ACCESS_KEY_ID: {path: ['s3_downloads', 'access_key_id']},
+	FLUXER_S3_DOWNLOADS_SECRET_ACCESS_KEY: {path: ['s3_downloads', 'secret_access_key']},
 	FLUXER_NATS_URL: {path: ['services', 'nats', 'core_url']},
 	FLUXER_NATS_CORE_URL: {path: ['services', 'nats', 'core_url']},
 	FLUXER_NATS_JETSTREAM_URL: {path: ['services', 'nats', 'jetstream_url']},
@@ -73,6 +79,14 @@ const NAMED_FLUXER_ENV_OVERRIDES: Record<string, NamedEnvOverride> = {
 	FLUXER_API_IP_BAN_EXEMPT_IPS: {path: ['services', 'api', 'ip_ban_exempt_ips'], parse: parseCsv},
 	FLUXER_API_PRESIGNED_ATTACHMENT_UPLOADS_ENABLED: {
 		path: ['services', 'api', 'presigned_attachment_uploads_enabled'],
+		parse: parseEnvValue,
+	},
+	FLUXER_API_PRESIGNED_DOWNLOADS_ENABLED: {
+		path: ['services', 'api', 'presigned_downloads_enabled'],
+		parse: parseEnvValue,
+	},
+	FLUXER_API_PRESIGNED_HARVEST_DOWNLOADS_ENABLED: {
+		path: ['services', 'api', 'presigned_harvest_downloads_enabled'],
 		parse: parseEnvValue,
 	},
 	FLUXER_API_WORKER_MODE: {path: ['services', 'api', 'worker', 'mode']},
@@ -84,6 +98,30 @@ const NAMED_FLUXER_ENV_OVERRIDES: Record<string, NamedEnvOverride> = {
 	},
 	FLUXER_API_WORKER_ENABLE_VOICE_RECONCILIATION: {
 		path: ['services', 'api', 'worker', 'enable_voice_reconciliation'],
+		parse: parseEnvValue,
+	},
+	FLUXER_API_WORKER_VOICE_RECONCILIATION_INTERVAL_MS: {
+		path: ['services', 'api', 'worker', 'voice_reconciliation', 'interval_ms'],
+		parse: parseEnvValue,
+	},
+	FLUXER_API_WORKER_VOICE_RECONCILIATION_STAGGER_DELAY_MS: {
+		path: ['services', 'api', 'worker', 'voice_reconciliation', 'stagger_delay_ms'],
+		parse: parseEnvValue,
+	},
+	FLUXER_API_WORKER_VOICE_RECONCILIATION_LOCK_TTL_SECONDS: {
+		path: ['services', 'api', 'worker', 'voice_reconciliation', 'lock_ttl_seconds'],
+		parse: parseEnvValue,
+	},
+	FLUXER_API_WORKER_VOICE_RECONCILIATION_CADENCE_TTL_SECONDS: {
+		path: ['services', 'api', 'worker', 'voice_reconciliation', 'cadence_ttl_seconds'],
+		parse: parseEnvValue,
+	},
+	FLUXER_API_WORKER_VOICE_RECONCILIATION_GATEWAY_ONLY_GRACE_MS: {
+		path: ['services', 'api', 'worker', 'voice_reconciliation', 'gateway_only_grace_ms'],
+		parse: parseEnvValue,
+	},
+	FLUXER_API_WORKER_VOICE_RECONCILIATION_LIVEKIT_ONLY_GRACE_MS: {
+		path: ['services', 'api', 'worker', 'voice_reconciliation', 'livekit_only_grace_ms'],
 		parse: parseEnvValue,
 	},
 	FLUXER_API_WORKER_LANE_CONCURRENCY_OVERRIDES: {
@@ -184,6 +222,7 @@ const NAMED_FLUXER_ENV_OVERRIDES: Record<string, NamedEnvOverride> = {
 	},
 	FLUXER_SUDO_MODE_SECRET: {path: ['auth', 'sudo_mode_secret']},
 	FLUXER_CONNECTION_INITIATION_SECRET: {path: ['auth', 'connection_initiation_secret']},
+	FLUXER_SSO_ALLOW_PRIVATE_ADDRESSES: {path: ['auth', 'sso_allow_private_addresses'], parse: parseEnvValue},
 	FLUXER_VAPID_PUBLIC_KEY: {path: ['auth', 'vapid', 'public_key']},
 	FLUXER_VAPID_PRIVATE_KEY: {path: ['auth', 'vapid', 'private_key']},
 	FLUXER_VAPID_EMAIL: {path: ['auth', 'vapid', 'email']},
@@ -227,6 +266,7 @@ const NAMED_FLUXER_ENV_OVERRIDES: Record<string, NamedEnvOverride> = {
 	FLUXER_LIVEKIT_API_KEY: {path: ['integrations', 'voice', 'api_key']},
 	FLUXER_LIVEKIT_API_SECRET: {path: ['integrations', 'voice', 'api_secret']},
 	FLUXER_LIVEKIT_URL: {path: ['integrations', 'voice', 'url']},
+	FLUXER_LIVEKIT_INTERNAL_URL: {path: ['integrations', 'voice', 'internal_url']},
 	FLUXER_LIVEKIT_WEBHOOK_URL: {path: ['integrations', 'voice', 'webhook_url']},
 	FLUXER_LIVEKIT_DEFAULT_REGION: {path: ['integrations', 'voice', 'default_region'], parse: parseEnvValue},
 	FLUXER_SEARCH_ENGINE: {path: ['integrations', 'search', 'engine']},
@@ -282,6 +322,7 @@ const NAMED_FLUXER_ENV_OVERRIDES: Record<string, NamedEnvOverride> = {
 	FLUXER_KLIPY_API_KEY: {path: ['integrations', 'klipy', 'api_key']},
 	FLUXER_YOUTUBE_API_KEY: {path: ['integrations', 'youtube', 'api_key']},
 	FLUXER_BUNNY_PURGE_ENABLED: {path: ['integrations', 'bunny', 'purge_enabled'], parse: parseEnvValue},
+	FLUXER_BLOCKLIST_FEEDS_ENABLED: {path: ['integrations', 'blocklist_feeds', 'enabled'], parse: parseEnvValue},
 	FLUXER_BUNNY_API_KEY: {path: ['integrations', 'bunny', 'api_key']},
 	FLUXER_BUNNY_PULL_ZONE_ID: {path: ['integrations', 'bunny', 'pull_zone_id'], parse: parseEnvValue},
 	FLUXER_RISK_INTEGRATION_ENABLED: {path: ['integrations', 'risk_integration', 'enabled'], parse: parseEnvValue},

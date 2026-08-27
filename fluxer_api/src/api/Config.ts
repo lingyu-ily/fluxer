@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type {MasterConfig} from '@fluxer/config/src/MasterConfig';
+import {resolveDownloadsProvider} from '@fluxer/config/src/S3DownloadsProvider';
 import {parseIpAddress} from '@fluxer/ip_utils/src/IpAddress';
 import {parseGeoipSourceConfig, resolveGeoipRuntimeSourceConfig} from '@pkgs/geoip/src/GeoipStartup';
 import type {APIConfig, BlueskyOAuthConfig} from './config/APIConfig';
@@ -237,6 +238,7 @@ export function buildAPIConfigFromMaster(master: MasterConfig): APIConfig {
 			cacheMinTtlSeconds: master.services.api.embeds.cache_min_ttl_seconds,
 			cacheRespectRemoteTtl: master.services.api.embeds.cache_respect_remote_ttl,
 		},
+		s3Downloads: resolveDownloadsProvider(master),
 		s3: {
 			endpoint: s3Config.endpoint,
 			presignedUrlBase: s3Config.presigned_url_base,
@@ -276,6 +278,9 @@ export function buildAPIConfigFromMaster(master: MasterConfig): APIConfig {
 			ipinfoApiKey: master.integrations.risk_integration.ipinfo_api_key || undefined,
 			accountPolicyDsl: master.integrations.risk_integration.account_policy_dsl,
 		},
+		blocklistFeeds: {
+			enabled: master.integrations.blocklist_feeds.enabled ?? !master.instance.self_hosted,
+		},
 		captcha: {
 			enabled: master.integrations.captcha.enabled,
 			provider: master.integrations.captcha.provider,
@@ -301,6 +306,7 @@ export function buildAPIConfigFromMaster(master: MasterConfig): APIConfig {
 			apiSecret: master.integrations.voice.api_secret,
 			webhookUrl: master.integrations.voice.webhook_url,
 			url: master.integrations.voice.url,
+			internalUrl: master.integrations.voice.internal_url,
 			defaultRegion: master.integrations.voice.default_region,
 		},
 		stripe: {
@@ -361,6 +367,7 @@ export function buildAPIConfigFromMaster(master: MasterConfig): APIConfig {
 		auth: {
 			sudoModeSecret: master.auth.sudo_mode_secret,
 			connectionInitiationSecret: master.auth.connection_initiation_secret,
+			ssoAllowPrivateAddresses: master.auth.sso_allow_private_addresses,
 			passkeys: {
 				rpName: master.auth.passkeys.rp_name,
 				rpId: master.auth.passkeys.rp_id,
@@ -425,6 +432,8 @@ export function buildAPIConfigFromMaster(master: MasterConfig): APIConfig {
 			testHarnessToken: master.dev.test_harness_token,
 		},
 		presignedAttachmentUploadsEnabled: master.services.api.presigned_attachment_uploads_enabled ?? false,
+		presignedDownloadsEnabled: master.services.api.presigned_downloads_enabled ?? false,
+		presignedHarvestDownloadsEnabled: master.services.api.presigned_harvest_downloads_enabled ?? true,
 		attachmentDecayEnabled: master.attachment_decay_enabled,
 		deletionGracePeriodHours: master.dev.test_mode_enabled ? 0.01 : master.deletion_grace_period_hours,
 		inactivityDeletionThresholdDays: master.inactivity_deletion_threshold_days,
@@ -456,6 +465,14 @@ export function buildAPIConfigFromMaster(master: MasterConfig): APIConfig {
 			taskName: apiWorkerConfig?.task as WorkerTaskName | undefined,
 			enableCronScheduler: apiWorkerConfig?.enable_cron_scheduler,
 			enableVoiceReconciliation: apiWorkerConfig?.enable_voice_reconciliation ?? true,
+			voiceReconciliation: {
+				intervalMs: apiWorkerConfig?.voice_reconciliation?.interval_ms,
+				staggerDelayMs: apiWorkerConfig?.voice_reconciliation?.stagger_delay_ms,
+				lockTtlSeconds: apiWorkerConfig?.voice_reconciliation?.lock_ttl_seconds,
+				cadenceTtlSeconds: apiWorkerConfig?.voice_reconciliation?.cadence_ttl_seconds,
+				gatewayOnlyGraceMs: apiWorkerConfig?.voice_reconciliation?.gateway_only_grace_ms,
+				liveKitOnlyGraceMs: apiWorkerConfig?.voice_reconciliation?.livekit_only_grace_ms,
+			},
 			laneConcurrencyOverrides: {
 				realtime: apiWorkerConfig?.lane_concurrency_overrides?.realtime,
 				unfurl: apiWorkerConfig?.lane_concurrency_overrides?.unfurl,

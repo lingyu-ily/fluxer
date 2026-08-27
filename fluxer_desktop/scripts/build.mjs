@@ -29,9 +29,8 @@ const electronExternals = [
 	'electron-log',
 	'update-electron-app',
 	'velopack',
+	'@fluxer/hardware-encoder',
 	'@fluxer/webauthn',
-	'@fluxer/webrtc-sender',
-	'node-mac-permissions',
 	'hunspell-asm',
 ];
 const pathAliasPlugin = {
@@ -136,7 +135,14 @@ function addFilesFromDirectory(files, packageDir, relativeDir, predicate) {
 
 function collectRuntimeArtifactPaths(packageDir) {
 	const artifacts = new Set();
-	for (const fileName of ['index.js', 'index.d.ts', 'binding.js', 'binding.d.ts', 'loader-diagnostics.cjs', 'pure.cjs']) {
+	for (const fileName of [
+		'index.js',
+		'index.d.ts',
+		'binding.js',
+		'binding.d.ts',
+		'loader-diagnostics.cjs',
+		'pure.cjs',
+	]) {
 		if (fs.existsSync(path.join(packageDir, fileName))) {
 			artifacts.add(fileName);
 		}
@@ -220,6 +226,16 @@ function platformTag(platform, arch) {
 }
 
 function expectedNativeRuntimeArtifacts(platform = process.platform, arch = process.env.ELECTRON_ARCH || process.arch) {
+	if (platform === 'darwin' && arch === 'universal') {
+		return [
+			...expectedNativeRuntimeArtifactsForArch(platform, 'arm64'),
+			...expectedNativeRuntimeArtifactsForArch(platform, 'x64'),
+		];
+	}
+	return expectedNativeRuntimeArtifactsForArch(platform, arch);
+}
+
+function expectedNativeRuntimeArtifactsForArch(platform, arch) {
 	const tag = platformTag(platform, arch);
 	if (!tag) return [];
 	const artifacts = [];
@@ -229,8 +245,8 @@ function expectedNativeRuntimeArtifacts(platform = process.platform, arch = proc
 		runtimeFiles: ['index.js', 'loader-diagnostics.cjs', 'pure.cjs'],
 	});
 	artifacts.push({
-		label: '@fluxer/webrtc-sender',
-		relativePath: `webrtc-sender.${tag}.node`,
+		label: '@fluxer/hardware-encoder',
+		relativePath: `hardware-encoder.${tag}.node`,
 		runtimeFiles: ['index.js'],
 	});
 	if (platform === 'darwin') {
@@ -410,8 +426,8 @@ function buildNativeAddons() {
 		jsEntry: 'index.js',
 	});
 	buildNativeAddon({
-		label: '@fluxer/webrtc-sender',
-		dirName: 'webrtc-sender',
+		label: '@fluxer/hardware-encoder',
+		dirName: 'hardware-encoder',
 		commands: [['pnpm', 'build']],
 		jsEntry: 'index.js',
 	});

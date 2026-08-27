@@ -93,6 +93,8 @@ function defaultConfig(): MasterConfig {
 				port: 8080,
 				ip_ban_exempt_ips: [],
 				presigned_attachment_uploads_enabled: false,
+				presigned_downloads_enabled: false,
+				presigned_harvest_downloads_enabled: true,
 				unfurl_ignored_hosts: [],
 				embeds: {
 					oembed_html_enabled: false,
@@ -149,6 +151,7 @@ function defaultConfig(): MasterConfig {
 		auth: {
 			sudo_mode_secret: '',
 			connection_initiation_secret: '',
+			sso_allow_private_addresses: false,
 			passkeys: {
 				rp_name: 'Fluxer',
 				rp_id: 'fluxer.app',
@@ -192,6 +195,7 @@ function defaultConfig(): MasterConfig {
 				api_key: '',
 				api_secret: '',
 				url: '',
+				internal_url: '',
 				webhook_url: '',
 			},
 			search: {
@@ -231,6 +235,7 @@ function defaultConfig(): MasterConfig {
 				api_key: '',
 				pull_zone_id: 0,
 			},
+			blocklist_feeds: {},
 			risk_integration: {
 				enabled: false,
 				ipinfo_api_key: '',
