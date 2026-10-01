@@ -90,6 +90,8 @@ role_specs(presence, _Role) ->
     ];
 role_specs(guilds, _Role) ->
     [
+        child_spec(gateway_clock_offset, gateway_clock_offset),
+        child_spec(guild_health, guild_health),
         child_spec(guild_counts_cache, guild_counts_cache),
         child_spec(guild_manager, guild_manager),
         child_spec(voice_state_counts_sync, voice_state_counts_sync)
@@ -98,7 +100,7 @@ role_specs(calls, Role) ->
     [child_spec(call_manager, call_manager)] ++ calls_voice_state_counts_sync_children(Role);
 role_specs(push, _Role) ->
     [
-        child_spec(push_dispatcher, push_dispatcher),
+        child_spec(push_outbox, push_outbox),
         child_spec(push, push)
     ].
 

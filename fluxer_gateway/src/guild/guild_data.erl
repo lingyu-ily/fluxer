@@ -23,10 +23,13 @@
 -type guild_id() :: integer().
 
 -define(CONNECT_SNAPSHOT_HEAVY_MEMBER_KEYS, [
-    <<"members">>, members_normalized, <<"member_role_index">>, members_sorted_ids
+    <<"members">>,
+    members_normalized,
+    <<"member_role_index">>,
+    members_sorted_ids,
+    member_list_revision
 ]).
 -define(CONNECT_SNAPSHOT_HEAVY_SESSION_KEYS, [active_guilds, user_roles, viewable_channels]).
--define(DEFAULT_CONNECT_SNAPSHOT_TRIM_MEMBERS, 5000).
 
 -export_type([guild_state/0, guild_reply/1, user_id/0]).
 
@@ -196,32 +199,7 @@ maybe_trim_connect_snapshot(Item, Base, State) ->
 
 -spec should_trim_connect_snapshot(guild_state()) -> boolean().
 should_trim_connect_snapshot(State) ->
-    case connect_snapshot_trim_member_threshold() of
-        undefined ->
-            false;
-        Threshold ->
-            member_count_at_least(Threshold, State) andalso has_members_ets(State)
-    end.
-
--spec member_count_at_least(pos_integer(), guild_state()) -> boolean().
-member_count_at_least(Threshold, State) ->
-    case maps:get(member_count, State, undefined) of
-        Count when is_integer(Count) -> Count >= Threshold;
-        _ -> false
-    end.
-
--spec connect_snapshot_trim_member_threshold() -> pos_integer() | undefined.
-connect_snapshot_trim_member_threshold() ->
-    case
-        application:get_env(
-            fluxer_gateway,
-            connect_snapshot_trim_member_threshold,
-            ?DEFAULT_CONNECT_SNAPSHOT_TRIM_MEMBERS
-        )
-    of
-        N when is_integer(N), N > 0 -> N;
-        _ -> undefined
-    end.
+    has_members_ets(State).
 
 -spec has_members_ets(guild_state()) -> boolean().
 has_members_ets(#{data := #{members_ets := Tab}}) -> is_reference(Tab);
@@ -329,8 +307,8 @@ get_guild_data_for_user(UserId, Data, State) ->
         undefined ->
             {reply, #{guild_data => null, error_reason => <<"forbidden">>}, State};
         Member ->
-            GuildData = build_member_guild_data(UserId, Member, Data, State),
-            {reply, #{guild_data => GuildData}, State}
+            {GuildData, NewState} = build_member_guild_data(UserId, Member, Data, State),
+            {reply, #{guild_data => GuildData}, NewState}
     end.
 
 -spec build_complete_guild_data(map(), guild_state()) -> map().
@@ -339,14 +317,17 @@ build_complete_guild_data(Data, State) ->
     Channels = map_utils:ensure_list(maps:get(<<"channels">>, Data, [])),
     maps:merge(GuildProperties, build_guild_collection_data(Data, Channels, State)).
 
--spec build_member_guild_data(user_id(), map(), map(), guild_state()) -> map().
+-spec build_member_guild_data(user_id(), map(), map(), guild_state()) -> {map(), guild_state()}.
 build_member_guild_data(UserId, Member, Data, State) ->
     GuildProperties = maps:get(<<"guild">>, Data, #{}),
     AllChannels = guild_data_channels:channels_from_data(Data),
-    {ViewableChannels, _JoinedAt} = guild_data_channels:derive_member_view(
+    {ViewableChannels, NewState} = guild_data_channels:member_view(
         UserId, Member, State, AllChannels
     ),
-    maps:merge(GuildProperties, build_guild_collection_data(Data, ViewableChannels, State)).
+    GuildData = maps:merge(
+        GuildProperties, build_guild_collection_data(Data, ViewableChannels, State)
+    ),
+    {GuildData, NewState}.
 
 -spec build_guild_collection_data(map(), [map()], guild_state()) -> map().
 build_guild_collection_data(Data, Channels, State) ->
@@ -549,47 +530,27 @@ projection_keeps_snapshot_without_sessions_test() ->
 trim_state(MemberCount) ->
     #{id => 42, member_count => MemberCount, data => #{members_ets => make_ref()}}.
 
-with_trim_threshold(Threshold, Fun) ->
-    application:set_env(fluxer_gateway, connect_snapshot_trim_member_threshold, Threshold),
+trim_applies_at_every_member_count_test() ->
+    ?assertEqual(true, should_trim_connect_snapshot(trim_state(49435))),
+    ?assertEqual(true, should_trim_connect_snapshot(trim_state(5000))),
+    ?assertEqual(true, should_trim_connect_snapshot(trim_state(1))),
+    ?assertEqual(true, should_trim_connect_snapshot(maps:remove(member_count, trim_state(1)))).
+
+trim_ignores_threshold_env_test() ->
+    application:set_env(fluxer_gateway, connect_snapshot_trim_member_threshold, 20000),
     try
-        Fun()
+        ?assertEqual(true, should_trim_connect_snapshot(trim_state(1)))
     after
         application:unset_env(fluxer_gateway, connect_snapshot_trim_member_threshold)
     end.
 
-trim_defaults_to_large_guilds_test() ->
-    application:unset_env(fluxer_gateway, connect_snapshot_trim_member_threshold),
-    Default = ?DEFAULT_CONNECT_SNAPSHOT_TRIM_MEMBERS,
-    ?assertEqual(true, should_trim_connect_snapshot(trim_state(49435))),
-    ?assertEqual(true, should_trim_connect_snapshot(trim_state(Default))),
-    ?assertEqual(false, should_trim_connect_snapshot(trim_state(Default - 1))).
-
-trim_needs_member_count_at_threshold_test() ->
-    with_trim_threshold(20000, fun() ->
-        ?assertEqual(true, should_trim_connect_snapshot(trim_state(49435))),
-        ?assertEqual(true, should_trim_connect_snapshot(trim_state(20000))),
-        ?assertEqual(false, should_trim_connect_snapshot(trim_state(19999))),
-        NoCount = maps:remove(member_count, trim_state(1)),
-        ?assertEqual(false, should_trim_connect_snapshot(NoCount))
-    end).
-
 trim_needs_members_ets_test() ->
-    with_trim_threshold(1, fun() ->
-        ?assertEqual(false, should_trim_connect_snapshot(#{member_count => 10, data => #{}})),
-        ?assertEqual(
-            false,
-            should_trim_connect_snapshot(#{member_count => 10, data => #{members_ets => 7}})
-        ),
-        ?assertEqual(false, should_trim_connect_snapshot(#{member_count => 10}))
-    end).
-
-trim_ignores_invalid_threshold_test() ->
-    with_trim_threshold(0, fun() ->
-        ?assertEqual(false, should_trim_connect_snapshot(trim_state(49435)))
-    end),
-    with_trim_threshold(not_an_integer, fun() ->
-        ?assertEqual(false, should_trim_connect_snapshot(trim_state(49435)))
-    end).
+    ?assertEqual(false, should_trim_connect_snapshot(#{member_count => 10, data => #{}})),
+    ?assertEqual(
+        false,
+        should_trim_connect_snapshot(#{member_count => 10, data => #{members_ets => 7}})
+    ),
+    ?assertEqual(false, should_trim_connect_snapshot(#{member_count => 10})).
 
 trim_and_projection_target_disjoint_keys_test() ->
     ?assertEqual(

@@ -15,9 +15,6 @@
         "msgid": "Bluesky OAuth"
       },
       {
-        "msgid": "Cloudflare Turnstile"
-      },
-      {
         "msgid": "Ctrl"
       },
       {
@@ -51,9 +48,6 @@
         "msgid": "deleted-role"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -81,9 +75,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Ctrl"
@@ -129,9 +120,6 @@
       },
       {
         "msgid": "deleted-role"
-      },
-      {
-        "msgid": "hCaptcha"
       },
       {
         "msgid": "macOS"
@@ -191,9 +179,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Ctrl"
@@ -331,9 +316,6 @@
         "msgid": "emoji {emojiName}"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -455,9 +437,6 @@
         "msgid": "Cisco"
       },
       {
-        "msgid": "Cloudflare Turnstile"
-      },
-      {
         "msgid": "Codec"
       },
       {
@@ -468,6 +447,9 @@
       },
       {
         "msgid": "Download"
+      },
+      {
+        "msgid": "Download app"
       },
       {
         "msgid": "Download {productName}"
@@ -764,9 +746,6 @@
         "msgid": "emoji {emojiName}"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "link"
       },
       {
@@ -932,9 +911,6 @@
       },
       {
         "msgid": "Client"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Code"
@@ -1153,9 +1129,6 @@
         "msgid": "deleted-role"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -1257,9 +1230,6 @@
         "msgid": "Cisco"
       },
       {
-        "msgid": "Cloudflare Turnstile"
-      },
-      {
         "msgid": "Ctrl"
       },
       {
@@ -1336,9 +1306,6 @@
       },
       {
         "msgid": "deleted-role"
-      },
-      {
-        "msgid": "hCaptcha"
       },
       {
         "msgid": "macOS"
@@ -1418,6 +1385,12 @@
       },
       {
         "msgid": "About me is too long"
+      },
+      {
+        "msgid": "Accept the push relay supplemental privacy notice"
+      },
+      {
+        "msgid": "Accepted"
       },
       {
         "msgid": "Add a Klipy API key to enable GIF search at runtime."
@@ -1522,10 +1495,16 @@
         "msgid": "Approval required"
       },
       {
+        "msgid": "Approve this app from the {productName} app you already use. No password needed."
+      },
+      {
         "msgid": "Are you sure you want to kick <0>{targetUserTag}</0> from the community? They will be able to rejoin with a new invite."
       },
       {
         "msgid": "Ask for a passkey after your password when you sign in"
+      },
+      {
+        "msgid": "Ask the administrators of this instance to review your account. This instance is run independently, and only its administrators can change your account."
       },
       {
         "msgid": "Attachment {pendingFilename}"
@@ -1538,6 +1517,9 @@
       },
       {
         "msgid": "Automatic ({codec})"
+      },
+      {
+        "msgid": "Back to {productName}"
       },
       {
         "msgid": "Backup code"
@@ -1571,6 +1553,24 @@
       },
       {
         "msgid": "Built-in suppression from your browser or system."
+      },
+      {
+        "msgid": "By purchasing, you agree to our <0>Privacy policy</0>."
+      },
+      {
+        "msgid": "By purchasing, you agree to our <0>Terms of service</0>."
+      },
+      {
+        "msgid": "By purchasing, you agree to our {legalDocument}."
+      },
+      {
+        "msgid": "By purchasing, you agreed to our <0>Privacy policy</0>."
+      },
+      {
+        "msgid": "By purchasing, you agreed to our <0>Terms of service</0>."
+      },
+      {
+        "msgid": "By purchasing, you agreed to our {legalDocument}."
       },
       {
         "msgid": "Camera access is needed for device previews"
@@ -1711,7 +1711,13 @@
         "msgid": "Changed the voice region from {oldRegion} to {newRegion}."
       },
       {
+        "msgid": "Checkout is blocked for this account."
+      },
+      {
         "msgid": "Choices"
+      },
+      {
+        "msgid": "Choose File, then Add to Dock."
       },
       {
         "msgid": "Choose how new accounts are created on this instance."
@@ -1759,6 +1765,12 @@
         "msgid": "Community overrides"
       },
       {
+        "msgid": "Compressing"
+      },
+      {
+        "msgid": "Compressing {percent}%"
+      },
+      {
         "msgid": "Connect a camera and try again."
       },
       {
@@ -1769,6 +1781,9 @@
       },
       {
         "msgid": "Connection volume controls"
+      },
+      {
+        "msgid": "Contact the administrators of this instance for help."
       },
       {
         "msgid": "Copy emoji"
@@ -1792,10 +1807,16 @@
         "msgid": "Couldn't update passkey two-factor authentication"
       },
       {
+        "msgid": "Couldn't update your passkey. Try again."
+      },
+      {
         "msgid": "Create administrator account"
       },
       {
         "msgid": "Create the administrator account"
+      },
+      {
+        "msgid": "Cropping {percent}%"
       },
       {
         "msgid": "Custom emoji {emojiName} from a community"
@@ -1864,6 +1885,15 @@
         "msgid": "Do you want to join {communityName}?"
       },
       {
+        "msgid": "Domain moved nagbar"
+      },
+      {
+        "msgid": "Download app"
+      },
+      {
+        "msgid": "Download app button in the sidebar"
+      },
+      {
         "msgid": "Drag members between voice channels they can access, and disconnect them from voice."
       },
       {
@@ -1871,6 +1901,9 @@
       },
       {
         "msgid": "Duplicate role"
+      },
+      {
+        "msgid": "Edit your messages above or below"
       },
       {
         "msgid": "Email us and a person will review your account. Tell us you cannot verify by SMS and we will take it from there. Replies come by email, so this is not instant."
@@ -1918,6 +1951,9 @@
         "msgid": "Enter the PIN for your security key to continue."
       },
       {
+        "msgid": "Enter this code in your old {PRODUCT_NAME} app to complete sign-in."
+      },
+      {
         "msgid": "Entire screen"
       },
       {
@@ -1939,6 +1975,9 @@
         "msgid": "Finish"
       },
       {
+        "msgid": "Finish in the new tab. If you closed it, press Continue with passkey again."
+      },
+      {
         "msgid": "Finish setup"
       },
       {
@@ -1954,10 +1993,16 @@
         "msgid": "Fully quit and restart {productName} so macOS applies this permission."
       },
       {
+        "msgid": "Get the new {productName} app"
+      },
+      {
         "msgid": "Give everyone on this instance the highest premium limits."
       },
       {
         "msgid": "Global shortcut"
+      },
+      {
+        "msgid": "Go back to {productName} to continue."
       },
       {
         "msgid": "Go to {communityName}"
@@ -1976,6 +2021,12 @@
       },
       {
         "msgid": "HEVC"
+      },
+      {
+        "msgid": "Have a gift code? Redeem it to unlock {PREMIUM_PRODUCT_NAME}."
+      },
+      {
+        "msgid": "Help button"
       },
       {
         "msgid": "Help translate {PRODUCT_NAME} into your language on <0>{I18N_WEBLATE_DOMAIN}</0>."
@@ -2009,6 +2060,12 @@
       },
       {
         "msgid": "Input level"
+      },
+      {
+        "msgid": "Install it from your browser menu."
+      },
+      {
+        "msgid": "Install the new app"
       },
       {
         "msgid": "Invite new people to the community with a link to this channel."
@@ -2069,6 +2126,9 @@
       },
       {
         "msgid": "Limited the channel to {count, plural, one {# user} other {# users}}."
+      },
+      {
+        "msgid": "Link a new device"
       },
       {
         "msgid": "Loading instance configuration"
@@ -2185,6 +2245,9 @@
         "msgid": "No part of {query} could be applied. Fix the underlined value or add something to search for."
       },
       {
+        "msgid": "Not accepted"
+      },
+      {
         "msgid": "Nothing to search for"
       },
       {
@@ -2198,6 +2261,21 @@
       },
       {
         "msgid": "Open popup"
+      },
+      {
+        "msgid": "Open the new app and choose Sign in with your old {productName} app. Then choose Link a new device here and enter the code it shows."
+      },
+      {
+        "msgid": "Open your old {PRODUCT_NAME} app and choose Link a new device, then enter the code below."
+      },
+      {
+        "msgid": "Open {host} in Safari."
+      },
+      {
+        "msgid": "Open {host} in your browser."
+      },
+      {
+        "msgid": "Open {productName} in your browser"
       },
       {
         "msgid": "Opens the Members page. Press Space or Enter to open."
@@ -2222,6 +2300,9 @@
       },
       {
         "msgid": "Our phone number check is down right now. This is on us, not your number. Wait a few minutes and try the same number again."
+      },
+      {
+        "msgid": "Passkey updated"
       },
       {
         "msgid": "Pause preview when Fluxer isn’t focused"
@@ -2272,6 +2353,12 @@
         "msgid": "Premium model"
       },
       {
+        "msgid": "Preparing"
+      },
+      {
+        "msgid": "Press Continue to use your passkey."
+      },
+      {
         "msgid": "Prevent <0>{targetUserTag}</0> from sending messages, reacting, and connecting to voice channels for the specified duration."
       },
       {
@@ -2293,6 +2380,9 @@
         "msgid": "Previous 6 days"
       },
       {
+        "msgid": "Previous channels"
+      },
+      {
         "msgid": "Product name"
       },
       {
@@ -2302,10 +2392,19 @@
         "msgid": "Public registration is closed."
       },
       {
+        "msgid": "Purchases are disabled for this account."
+      },
+      {
+        "msgid": "Push relay notice"
+      },
+      {
         "msgid": "Read messages sent before they opened a channel. Without it, they only see messages that arrive while it is open."
       },
       {
         "msgid": "Read messages sent in this channel before they opened it. Without it, they only see messages that arrive while it is open."
+      },
+      {
+        "msgid": "Read the supplemental privacy notice"
       },
       {
         "msgid": "Reason (optional)."
@@ -2426,6 +2525,9 @@
       },
       {
         "msgid": "Renamed the community from {oldName} to {newName}."
+      },
+      {
+        "msgid": "Reply to messages above or below"
       },
       {
         "msgid": "Require a passkey as your second factor"
@@ -2551,6 +2653,21 @@
         "msgid": "Search for {query}"
       },
       {
+        "msgid": "Searching all users"
+      },
+      {
+        "msgid": "Searching communities"
+      },
+      {
+        "msgid": "Searching friends and members of {communityName}"
+      },
+      {
+        "msgid": "Searching text channels"
+      },
+      {
+        "msgid": "Searching voice channels"
+      },
+      {
         "msgid": "Second factor"
       },
       {
@@ -2563,6 +2680,9 @@
         "msgid": "See this channel. Denying it for {everyoneMention} makes the channel private."
       },
       {
+        "msgid": "Select the account you want to sign in with on your new device."
+      },
+      {
         "msgid": "Self-host setup"
       },
       {
@@ -2573,6 +2693,9 @@
       },
       {
         "msgid": "Send messages in this channel."
+      },
+      {
+        "msgid": "Sending an SMS to this phone number is too expensive for {PRODUCT_NAME}, so we need you to send us an SMS instead. We know this isn't ideal. You can also ask the administrators of this instance to lift this requirement from your account."
       },
       {
         "msgid": "Sending {resolution} at {frameRate} FPS with {codec}"
@@ -2740,6 +2863,9 @@
         "msgid": "Show fewer filters"
       },
       {
+        "msgid": "Show me how"
+      },
+      {
         "msgid": "Show per-device participant volume sliders in voice menus"
       },
       {
@@ -2750,6 +2876,9 @@
       },
       {
         "msgid": "Showed members with this role in their own section in the member list."
+      },
+      {
+        "msgid": "Sign in with your old {productName} app"
       },
       {
         "msgid": "Sign-in details"
@@ -2810,6 +2939,9 @@
       },
       {
         "msgid": "Still Neko"
+      },
+      {
+        "msgid": "Still working on it…"
       },
       {
         "msgid": "Stop Neko from chasing your cursor while keeping it draggable and interactive."
@@ -2881,6 +3013,9 @@
         "msgid": "Talk in calls and test your input."
       },
       {
+        "msgid": "Tap Share, then Add to Home Screen."
+      },
+      {
         "msgid": "Text is rendered with grayscale antialiasing instead of ClearType while transparency is enabled, so it will look softer."
       },
       {
@@ -2950,6 +3085,9 @@
         "msgid": "The new price is already scheduled for {effectiveDate}."
       },
       {
+        "msgid": "The official Fluxer mobile apps receive notifications through Fluxer's push relay, which hands them to Apple and Google. Self-hosted UnifiedPush and ntfy endpoints never reach the relay and need no agreement."
+      },
+      {
         "msgid": "The override allowed {permissions}."
       },
       {
@@ -2974,10 +3112,25 @@
         "msgid": "These options change how people use the instance. Some can only be chosen during setup."
       },
       {
+        "msgid": "This animation is too long or too large to crop. Try a shorter or smaller file."
+      },
+      {
+        "msgid": "This browser can't crop animated {AVIF_FORMAT_LABEL} files. Upload a GIF or WebP instead."
+      },
+      {
+        "msgid": "This browser can't crop animated {avifFormatLabel} files. Upload a GIF or WebP instead."
+      },
+      {
+        "msgid": "This browser has WebAssembly turned off, so animated images can't be cropped."
+      },
+      {
         "msgid": "This device could not keep up with {targetResolution} at {targetFrameRate} FPS last time, so your stream started at {resolution} at {frameRate} FPS."
       },
       {
         "msgid": "This emoji is from"
+      },
+      {
+        "msgid": "This image couldn't be read. It may be damaged."
       },
       {
         "msgid": "This instance currently allows screen share up to 720p at 30 FPS."
@@ -2993,6 +3146,9 @@
       },
       {
         "msgid": "This is a custom sticker from a community. Ask the author for an invite to use this sticker."
+      },
+      {
+        "msgid": "This is not available on your account right now. Ask the administrators of this instance to review it."
       },
       {
         "msgid": "This is not available on your account right now. Email {supportEmail} and a person will review it."
@@ -3020,6 +3176,9 @@
       },
       {
         "msgid": "This option is required. Please provide a value."
+      },
+      {
+        "msgid": "This request has expired. Go back and try again."
       },
       {
         "msgid": "This reset link has expired. Reset links last 1 hour. Please request a new one."
@@ -3082,6 +3241,15 @@
         "msgid": "Unavailable"
       },
       {
+        "msgid": "Unread channels"
+      },
+      {
+        "msgid": "Update passkey"
+      },
+      {
+        "msgid": "Update your passkey"
+      },
+      {
         "msgid": "Upload files and media in messages."
       },
       {
@@ -3115,6 +3283,9 @@
         "msgid": "Use your operating system's spellchecker when available. Otherwise, use {productName}'s in-app dictionaries."
       },
       {
+        "msgid": "Use your passkey"
+      },
+      {
         "msgid": "Used in Custom mode. The Gaming and Screen share presets set their own hint."
       },
       {
@@ -3122,6 +3293,9 @@
       },
       {
         "msgid": "Volume sliders"
+      },
+      {
+        "msgid": "We couldn't reach the attachment upload service. {PRODUCT_NAME} can fall back to the standard upload path for messages up to {fallbackSizeFormatted} total, but these attachments exceed that combined limit and can't be sent until connectivity is restored. Try again later or contact the administrators of this instance if this keeps happening."
       },
       {
         "msgid": "We couldn't verify this number automatically. Contact support and a person will review your account."
@@ -3158,6 +3332,12 @@
       },
       {
         "msgid": "You asked for {resolution} at {frameRate} FPS"
+      },
+      {
+        "msgid": "You can close this tab"
+      },
+      {
+        "msgid": "You can still ask the administrators of this instance for a human review at any time."
       },
       {
         "msgid": "You can still email {supportEmail} for a human review at any time."
@@ -3200,6 +3380,12 @@
       },
       {
         "msgid": "Your device could not keep up, so your stream now sends {resolution} to keep {frameRate} FPS smooth."
+      },
+      {
+        "msgid": "Your device will ask you to save an updated passkey for {name}. It replaces the old one."
+      },
+      {
+        "msgid": "Your device will ask you to save an updated passkey for {name}. Use the same phone or security key you just used."
       },
       {
         "msgid": "Your new nickname, or leave blank to reset it."
@@ -3251,6 +3437,9 @@
       },
       {
         "msgid": "online"
+      },
+      {
+        "msgid": "{PAYMENT_PROVIDER_NAME} handles payment securely."
       },
       {
         "msgid": "{PRODUCT_NAME} needs to restart for the title bar change to take effect."
@@ -3715,6 +3904,9 @@
         "msgid": "{actor} updated {target}."
       },
       {
+        "msgid": "{appName} can't reach its servers. It will keep trying in the background."
+      },
+      {
         "msgid": "{channelHeading}, {mentionCount, plural, one {# mention} other {# mentions}}"
       },
       {
@@ -3778,7 +3970,25 @@
         "msgid": "{productName} cannot start a safe isolated route for this app's audio."
       },
       {
+        "msgid": "{productName} has moved to {host}. Add it to your Home Screen or Dock, then sign in with this app."
+      },
+      {
+        "msgid": "{productName} has moved to {host}. Install it from your browser, then sign in with this app."
+      },
+      {
+        "msgid": "{productName} has moved to {host}. Install the new app and you will already be signed in."
+      },
+      {
+        "msgid": "{productName} has moved to {host}. Open it in your browser to install the new app."
+      },
+      {
         "msgid": "{productName} needs screen recording access. Allow screen recording in your operating system privacy settings and restart the app."
+      },
+      {
+        "msgid": "{productName} now lives at {host}. Install it from there, then sign in with this app."
+      },
+      {
+        "msgid": "{productName} now lives at {host}. Install it from there."
       },
       {
         "msgid": "{productName} wordmark"
@@ -3899,9 +4109,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Color"
@@ -4072,9 +4279,6 @@
         "msgid": "emoji {emojiName}"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -4190,9 +4394,6 @@
         "msgid": "Cisco"
       },
       {
-        "msgid": "Cloudflare Turnstile"
-      },
-      {
         "msgid": "Color"
       },
       {
@@ -4298,9 +4499,6 @@
         "msgid": "emoji {emojiName}"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -4376,9 +4574,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Ctrl"
@@ -4469,9 +4664,6 @@
       },
       {
         "msgid": "emoji {emojiName}"
-      },
-      {
-        "msgid": "hCaptcha"
       },
       {
         "msgid": "macOS"
@@ -4590,9 +4782,6 @@
       },
       {
         "msgid": "Client"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Code"
@@ -4895,9 +5084,6 @@
         "msgid": "deleted-role"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "image"
       },
       {
@@ -5018,9 +5204,6 @@
         "msgid": "Alt"
       },
       {
-        "msgid": "Cloudflare Turnstile"
-      },
-      {
         "msgid": "Ctrl"
       },
       {
@@ -5073,9 +5256,6 @@
       },
       {
         "msgid": "deleted-role"
-      },
-      {
-        "msgid": "hCaptcha"
       },
       {
         "msgid": "macOS"
@@ -5152,9 +5332,6 @@
         "msgid": "deleted-role"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -5215,9 +5392,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Ctrl"
@@ -5328,9 +5502,6 @@
         "msgid": "emoji {emojiName}"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -5394,9 +5565,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Ctrl"
@@ -5498,9 +5666,6 @@
         "msgid": "deleted-role"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "link"
       },
       {
@@ -5600,9 +5765,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Codec"
@@ -5806,9 +5968,6 @@
         "msgid": "deleted-role"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -5936,9 +6095,6 @@
       },
       {
         "msgid": "Client"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Codec"
@@ -6154,9 +6310,6 @@
         "msgid": "deleted-role"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "link"
       },
       {
@@ -6258,9 +6411,6 @@
         "msgid": "Cisco"
       },
       {
-        "msgid": "Cloudflare Turnstile"
-      },
-      {
         "msgid": "Ctrl"
       },
       {
@@ -6330,9 +6480,6 @@
         "msgid": "deleted-role"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -6383,9 +6530,6 @@
         "msgid": "Bluesky OAuth"
       },
       {
-        "msgid": "Cloudflare Turnstile"
-      },
-      {
         "msgid": "Ctrl"
       },
       {
@@ -6420,9 +6564,6 @@
       },
       {
         "msgid": "deleted-role"
-      },
-      {
-        "msgid": "hCaptcha"
       },
       {
         "msgid": "macOS"
@@ -6592,9 +6733,6 @@
       },
       {
         "msgid": "Client"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Code"
@@ -6777,6 +6915,9 @@
         "msgid": "Open {displayName}"
       },
       {
+        "msgid": "Open {host} in Safari."
+      },
+      {
         "msgid": "Open {landmarkName}"
       },
       {
@@ -6957,9 +7098,6 @@
         "msgid": "emoji {emojiName}"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "link"
       },
       {
@@ -7102,9 +7240,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Ctrl"
@@ -7320,9 +7455,6 @@
         "msgid": "emoji {emojiName}"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -7372,9 +7504,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Ctrl"
@@ -7518,9 +7647,6 @@
         "msgid": "deleted-role"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -7585,9 +7711,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Codec"
@@ -7770,9 +7893,6 @@
         "msgid": "emoji {emojiName}"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "link"
       },
       {
@@ -7903,9 +8023,6 @@
       },
       {
         "msgid": "Client"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Codec"
@@ -8133,9 +8250,6 @@
         "msgid": "emoji {emojiName}"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "link"
       },
       {
@@ -8230,9 +8344,6 @@
         "msgid": "Cisco"
       },
       {
-        "msgid": "Cloudflare Turnstile"
-      },
-      {
         "msgid": "Ctrl"
       },
       {
@@ -8276,9 +8387,6 @@
       },
       {
         "msgid": "deleted-role"
-      },
-      {
-        "msgid": "hCaptcha"
       },
       {
         "msgid": "macOS"
@@ -8347,9 +8455,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Codec"
@@ -8538,9 +8643,6 @@
         "msgid": "emoji {emojiName}"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -8631,9 +8733,6 @@
         "msgid": "Cisco"
       },
       {
-        "msgid": "Cloudflare Turnstile"
-      },
-      {
         "msgid": "Ctrl"
       },
       {
@@ -8683,9 +8782,6 @@
       },
       {
         "msgid": "deleted-role"
-      },
-      {
-        "msgid": "hCaptcha"
       },
       {
         "msgid": "macOS"
@@ -8742,9 +8838,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Ctrl"
@@ -8846,9 +8939,6 @@
         "msgid": "deleted-role"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -8899,9 +8989,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Ctrl"
@@ -8961,9 +9048,6 @@
         "msgid": "deleted-role"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -9015,9 +9099,6 @@
       },
       {
         "msgid": "Cisco"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Croatia"
@@ -9140,9 +9221,6 @@
         "msgid": "deleted-role"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -9186,9 +9264,6 @@
       },
       {
         "msgid": "Bluesky OAuth"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Ctrl"
@@ -9245,9 +9320,6 @@
         "msgid": "deleted-role"
       },
       {
-        "msgid": "hCaptcha"
-      },
-      {
         "msgid": "macOS"
       },
       {
@@ -9290,9 +9362,6 @@
       },
       {
         "msgid": "Bluesky OAuth"
-      },
-      {
-        "msgid": "Cloudflare Turnstile"
       },
       {
         "msgid": "Ctrl"
@@ -9350,9 +9419,6 @@
       },
       {
         "msgid": "deleted-role"
-      },
-      {
-        "msgid": "hCaptcha"
       },
       {
         "msgid": "macOS"

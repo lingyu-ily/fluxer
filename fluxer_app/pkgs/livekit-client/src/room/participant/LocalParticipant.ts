@@ -814,7 +814,6 @@ export default class LocalParticipant extends Participant {
 			...this.roomOptions.publishDefaults,
 			...options,
 		};
-		track.screenShareDelivery = this.roomOptions.screenShareDelivery ?? false;
 		const isStereoInput =
 			('channelCount' in track.mediaStreamTrack.getSettings() &&
 				track.mediaStreamTrack.getSettings().channelCount === 2) ||
@@ -967,7 +966,7 @@ export default class LocalParticipant extends Participant {
 		if (settings.noiseSuppression) {
 			audioFeatures.push(AudioTrackFeature.TF_NOISE_SUPPRESSION);
 		}
-		if (settings.channelCount && settings.channelCount > 1) {
+		if (isStereo) {
 			audioFeatures.push(AudioTrackFeature.TF_STEREO);
 		}
 		if (disableDtx) {
@@ -1788,7 +1787,7 @@ export default class LocalParticipant extends Participant {
 			return;
 		}
 		let subscribedCodecs = update.subscribedCodecs;
-		if (this.roomOptions.screenShareDelivery && hasSingleRidlessEncoding(pub.videoTrack)) {
+		if (hasSingleRidlessEncoding(pub.videoTrack)) {
 			subscribedCodecs = subscribedCodecs.filter((codec) => codec.qualities.some((quality) => quality.enabled));
 			if (subscribedCodecs.length === 0) {
 				return;

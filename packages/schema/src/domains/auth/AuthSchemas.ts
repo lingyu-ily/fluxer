@@ -441,9 +441,7 @@ const PhoneSendVerificationInboundChallengeResponse = z.object({
 	challenge_code: createStringType(4, 12).describe('The numeric code the user must text to our number'),
 	our_number: createStringType(4, 32).describe('The Twilio number the user must text the code to (E.164)'),
 	expires_at: z.iso.datetime().describe('ISO 8601 timestamp when this inbound challenge expires'),
-	reason: z
-		.enum(['voip', 'canadian', 'unknown_line_type', 'expensive_destination', 'account_forced', 'behavioural_risk'])
-		.describe('Why inbound verification is required'),
+	reason: z.enum(['verification_required']).describe('Always verification_required'),
 });
 
 export const PhoneSendVerificationResponse = z.union([
@@ -471,6 +469,7 @@ export const WebAuthnCredentialResponse = z.object({
 	name: z.string().describe('User-assigned name for the credential'),
 	created_at: z.string().describe('When the credential was registered'),
 	last_used_at: z.string().nullable().describe('When the credential was last used'),
+	rp_id: z.string().describe('Relying party ID the passkey belongs to'),
 });
 
 export type WebAuthnCredentialResponse = z.infer<typeof WebAuthnCredentialResponse>;

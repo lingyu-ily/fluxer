@@ -32,11 +32,6 @@ const voiceStates: Record<string, Record<string, Record<string, unknown>>> = {};
 const settingsUpdate = vi.fn();
 const openPremiumModal = vi.fn();
 
-vi.mock('@app/features/voice/state/ScreenShareDeliveryRollout', () => ({
-	ScreenShareDeliveryRollout: {enabled: true},
-	default: {enabled: true},
-}));
-
 vi.mock('@app/features/voice/utils/GpuEncoderCapabilities', () => ({
 	getGpuEncoderReportSync: () => gpuReport,
 	getH264HardwareProfilesSync: () => h264HardwareProfiles,
@@ -318,7 +313,7 @@ const BOOTSTRAP_ENDPOINT = 'https://primary.test/api';
 			webapp: 'https://app.primary.test',
 			upload_relay: 'https://upload.primary.test',
 		},
-		captcha: {provider: 'none', hcaptcha_site_key: null, turnstile_site_key: null},
+		captcha: {provider: 'none'},
 		features: {
 			voice_enabled: false,
 			stripe_enabled: false,
