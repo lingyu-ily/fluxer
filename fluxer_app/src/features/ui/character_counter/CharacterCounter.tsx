@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import {PREMIUM_PRODUCT_NAME} from '@app/features/app/config/I18nDisplayConstants';
 import {getCachedNumberFormat} from '@app/features/i18n/utils/IntlCache';
-import {shouldShowPremiumFeatures} from '@app/features/premium/utils/PremiumUtils';
+import {getPremiumProductName, shouldShowPremiumFeatures} from '@app/features/premium/utils/PremiumUtils';
 import {CharacterCountAnnouncer} from '@app/features/ui/character_counter/CharacterCountAnnouncer';
 import styles from '@app/features/ui/character_counter/CharacterCounter.module.css';
 import {
@@ -34,15 +33,18 @@ export const CharacterCounter = observer(
 		const isNearingLimit = remaining < 50;
 		const showPremiumFeatures = shouldShowPremiumFeatures();
 		const needsPremium = canUpgrade && showPremiumFeatures && (isNearingLimit || isOverLimit);
-		const tooltipText = needsPremium
-			? i18n._(CHARACTERS_LEFT_GET_TO_WRITE_UP_TO_CHARACTERS_DESCRIPTOR, {
-					remaining,
-					premiumProductName: PREMIUM_PRODUCT_NAME,
-					premiumMaxLength,
-				})
-			: isOverLimit
-				? i18n._(MESSAGE_IS_TOO_LONG_DESCRIPTOR)
-				: i18n._(CHARACTERS_LEFT_DESCRIPTOR, {remaining});
+		let tooltipText: string;
+		if (needsPremium) {
+			tooltipText = i18n._(CHARACTERS_LEFT_GET_TO_WRITE_UP_TO_CHARACTERS_DESCRIPTOR, {
+				remaining,
+				premiumProductName: getPremiumProductName(),
+				premiumMaxLength,
+			});
+		} else if (isOverLimit) {
+			tooltipText = i18n._(MESSAGE_IS_TOO_LONG_DESCRIPTOR);
+		} else {
+			tooltipText = i18n._(CHARACTERS_LEFT_DESCRIPTOR, {remaining});
+		}
 		const colorClass = isOverLimit || isNearingLimit ? styles.textDanger : styles.textTertiary;
 		const counter = needsPremium ? (
 			<Tooltip text={tooltipText} data-flx="ui.character-counter.character-counter.tooltip">

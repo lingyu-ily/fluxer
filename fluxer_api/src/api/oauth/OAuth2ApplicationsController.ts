@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import {DefaultUserOnly, LoginRequiredAllowSuspicious} from '@app/api/middleware/AuthMiddleware';
+import {DefaultUserOnly, LoginRequired} from '@app/api/middleware/AuthMiddleware';
 import {CaptchaMiddleware} from '@app/api/middleware/CaptchaMiddleware';
 import {RateLimitMiddleware} from '@app/api/middleware/RateLimitMiddleware';
+import {jsonAssetBodyLimit, RequestBodyLimit} from '@app/api/middleware/RequestBodyLimitMiddleware';
 import {OpenAPI} from '@app/api/middleware/ResponseTypeMiddleware';
 import {SudoModeMiddleware} from '@app/api/middleware/SudoModeMiddleware';
 import {RateLimitConfigs} from '@app/api/RateLimitConfig';
@@ -39,7 +40,7 @@ export function OAuth2ApplicationsController(app: HonoApp) {
 	app.get(
 		'/users/@me/applications',
 		RateLimitMiddleware(RateLimitConfigs.OAUTH_DEV_CLIENTS_LIST),
-		LoginRequiredAllowSuspicious,
+		LoginRequired,
 		DefaultUserOnly,
 		OpenAPI({
 			operationId: 'list_user_applications',
@@ -56,7 +57,7 @@ export function OAuth2ApplicationsController(app: HonoApp) {
 	app.get(
 		'/oauth2/applications/@me',
 		RateLimitMiddleware(RateLimitConfigs.OAUTH_DEV_CLIENTS_LIST),
-		LoginRequiredAllowSuspicious,
+		LoginRequired,
 		OpenAPI({
 			operationId: 'get_oauth_applications_me',
 			summary: 'Get current applications endpoint',
@@ -72,7 +73,7 @@ export function OAuth2ApplicationsController(app: HonoApp) {
 	app.post(
 		'/oauth2/applications',
 		RateLimitMiddleware(RateLimitConfigs.OAUTH_DEV_CLIENT_CREATE),
-		LoginRequiredAllowSuspicious,
+		LoginRequired,
 		DefaultUserOnly,
 		CaptchaMiddleware,
 		Validator('json', ApplicationCreateRequest),
@@ -96,7 +97,7 @@ export function OAuth2ApplicationsController(app: HonoApp) {
 	app.get(
 		'/oauth2/applications/:id',
 		RateLimitMiddleware(RateLimitConfigs.OAUTH_DEV_CLIENTS_LIST),
-		LoginRequiredAllowSuspicious,
+		LoginRequired,
 		DefaultUserOnly,
 		Validator('param', ApplicationIdParam),
 		OpenAPI({
@@ -120,7 +121,7 @@ export function OAuth2ApplicationsController(app: HonoApp) {
 	app.patch(
 		'/oauth2/applications/:id',
 		RateLimitMiddleware(RateLimitConfigs.OAUTH_DEV_CLIENT_UPDATE),
-		LoginRequiredAllowSuspicious,
+		LoginRequired,
 		DefaultUserOnly,
 		Validator('param', ApplicationIdParam),
 		Validator('json', ApplicationUpdateRequest),
@@ -146,7 +147,7 @@ export function OAuth2ApplicationsController(app: HonoApp) {
 	app.delete(
 		'/oauth2/applications/:id',
 		RateLimitMiddleware(RateLimitConfigs.OAUTH_DEV_CLIENT_DELETE),
-		LoginRequiredAllowSuspicious,
+		LoginRequired,
 		DefaultUserOnly,
 		SudoModeMiddleware,
 		Validator('param', ApplicationIdParam),
@@ -175,8 +176,9 @@ export function OAuth2ApplicationsController(app: HonoApp) {
 	);
 	app.patch(
 		'/oauth2/applications/:id/bot',
+		RequestBodyLimit(jsonAssetBodyLimit({avatar: 1, banner: 1})),
 		RateLimitMiddleware(RateLimitConfigs.OAUTH_DEV_CLIENT_UPDATE),
-		LoginRequiredAllowSuspicious,
+		LoginRequired,
 		DefaultUserOnly,
 		Validator('param', ApplicationIdParam),
 		Validator('json', BotProfileUpdateRequest),

@@ -3,7 +3,7 @@
 import type {ChannelID, GuildID, UserID} from '@app/api/BrandedTypes';
 import type {VoiceRegionMetadata, VoiceServerRecord} from '@app/api/voice/VoiceModel';
 
-interface CreateTokenParams {
+export interface CreateTokenParams {
 	userId: UserID;
 	guildId?: GuildID;
 	channelId: ChannelID;
@@ -18,7 +18,7 @@ interface CreateTokenParams {
 	canVideo?: boolean;
 }
 
-interface UpdateParticipantParams {
+export interface UpdateParticipantParams {
 	userId: UserID;
 	guildId?: GuildID;
 	channelId: ChannelID;
@@ -32,7 +32,17 @@ interface UpdateParticipantParams {
 	canVideo?: boolean;
 }
 
-interface UpdateParticipantPermissionsParams {
+export interface MuteMicrophoneTrackParams {
+	userId: UserID;
+	guildId?: GuildID;
+	channelId: ChannelID;
+	connectionId: string;
+	regionId: string;
+	serverId: string;
+	trackSid: string;
+}
+
+export interface UpdateParticipantPermissionsParams {
 	userId: UserID;
 	guildId?: GuildID;
 	channelId: ChannelID;
@@ -45,7 +55,7 @@ interface UpdateParticipantPermissionsParams {
 	deaf?: boolean;
 }
 
-interface DisconnectParticipantParams {
+export interface DisconnectParticipantParams {
 	userId: UserID;
 	guildId?: GuildID;
 	channelId: ChannelID;
@@ -54,21 +64,21 @@ interface DisconnectParticipantParams {
 	serverId: string;
 }
 
-interface ListParticipantsParams {
+export interface ListParticipantsParams {
 	guildId?: GuildID;
 	channelId: ChannelID;
 	regionId: string;
 	serverId: string;
 }
 
-export interface ListParticipantsSuccess {
+interface ListParticipantsSuccess {
 	status: 'ok';
 	participants: Array<{
 		identity: string;
 	}>;
 }
 
-export interface ListParticipantsError {
+interface ListParticipantsError {
 	status: 'error';
 	errorCode: string;
 	retryable: boolean;
@@ -86,6 +96,8 @@ export abstract class ILiveKitService {
 	abstract updateParticipant(params: UpdateParticipantParams): Promise<void>;
 
 	abstract updateParticipantPermissions(params: UpdateParticipantPermissionsParams): Promise<void>;
+
+	abstract muteMicrophoneTrack(params: MuteMicrophoneTrackParams): Promise<void>;
 
 	abstract disconnectParticipant(params: DisconnectParticipantParams): Promise<void>;
 

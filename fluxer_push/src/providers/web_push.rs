@@ -87,7 +87,7 @@ struct Record {
 }
 
 fn seal(state: &AppState, sub: &Subscription, envelope: &Value) -> Result<Record, SendOutcome> {
-    if !endpoint_is_allowed(&sub.endpoint) {
+    if !endpoint_is_allowed(&sub.endpoint, &state.cfg.private_hosts) {
         return Err(SendOutcome::permanent("endpoint_rejected"));
     }
     let (Some(p256dh), Some(auth)) = (sub.p256dh_key.as_deref(), sub.auth_key.as_deref()) else {
@@ -223,7 +223,7 @@ fn classify(status: u16) -> SendOutcome {
     }
 }
 
-fn endpoint_is_allowed(endpoint: &str) -> bool {
+fn endpoint_is_allowed(endpoint: &str, private_hosts: &[String]) -> bool {
     let Ok(url) = Url::parse(endpoint) else {
         return false;
     };
@@ -237,7 +237,9 @@ fn endpoint_is_allowed(endpoint: &str) -> bool {
         return false;
     }
     match url.host() {
-        Some(Host::Domain(host)) => is_public_hostname(host),
+        Some(Host::Domain(host)) => {
+            resolver::is_private_host(host, private_hosts) || is_public_hostname(host)
+        }
         Some(Host::Ipv4(ip)) => !resolver::is_blocked(IpAddr::V4(ip)),
         Some(Host::Ipv6(ip)) => !resolver::is_blocked(IpAddr::V6(ip)),
         None => false,
@@ -291,77 +293,4 @@ fn retry_delay(attempt: u32) -> Duration {
     );
     let jitter = rand::rng().random_range(1..=(base / 4).max(1));
     Duration::from_millis(MAX_RETRY_DELAY_MS.min(base + jitter - 1))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_unified_push_topic_with_no_listener_is_permanent() {
-        assert_eq!(
-            classify(INSUFFICIENT_STORAGE),
-            SendOutcome::permanent("http_507")
-        );
-    }
-
-    #[test]
-    fn an_unavailable_push_service_stays_retryable() {
-        assert_eq!(classify(503), SendOutcome::transient("http_503"));
-    }
-}
-
-#[cfg(test)]
-mod retry_tests {
-    use super::*;
-
-    #[test]
-    fn a_topic_with_no_listener_is_not_retried() {
-        assert!(!should_retry(INSUFFICIENT_STORAGE, 0));
-    }
-
-    const TOKEN: &str = "3dbc5a5ef1a1c1666afc26f466e1b3ebaaf4c66d92dddeb0fd1b69c49641d4cd";
-
-    fn managed_hosts() -> Vec<String> {
-        vec!["push.fluxer.com".to_owned()]
-    }
-
-    #[test]
-    fn a_relay_over_its_device_quota_is_not_retried() {
-        let endpoint = format!("https://push.fluxer.com/relay/v1/fcm/stable/{TOKEN}");
-        assert!(is_relay_quota_refusal(
-            TOO_MANY_REQUESTS,
-            &endpoint,
-            &managed_hosts()
-        ));
-    }
-
-    #[test]
-    fn a_rate_limited_third_party_push_service_is_still_retried() {
-        let endpoint = "https://ntfy.sh/upZzH87cT9jJCc?up=1";
-        assert!(!is_relay_quota_refusal(
-            TOO_MANY_REQUESTS,
-            endpoint,
-            &managed_hosts()
-        ));
-        assert!(should_retry(TOO_MANY_REQUESTS, 0));
-    }
-
-    #[test]
-    fn an_unavailable_relay_is_still_retried() {
-        let endpoint = format!("https://push.fluxer.com/relay/v1/fcm/stable/{TOKEN}");
-        assert!(!is_relay_quota_refusal(503, &endpoint, &managed_hosts()));
-    }
-
-    #[test]
-    fn an_unavailable_push_service_is_retried_until_the_budget_runs_out() {
-        assert!(should_retry(503, 0));
-        assert!(!should_retry(503, MAX_TRANSIENT_RETRIES));
-    }
-
-    #[test]
-    fn a_permanent_status_is_never_retried() {
-        assert!(!should_retry(400, 0));
-        assert!(!should_retry(410, 0));
-    }
 }

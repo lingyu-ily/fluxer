@@ -3,11 +3,15 @@
 import {MFA_CODE_DIGIT_COUNT} from '@app/features/app/config/I18nDisplayConstants';
 import FormField from '@app/features/auth/flow/AuthFormField';
 import styles from '@app/features/auth/flow/MfaScreen.module.css';
-import {useAuthCardPresentation} from '@app/features/auth/flow/useAuthCardPresentation';
+import {useAuthPresentation} from '@app/features/auth/flow/useAuthPresentation';
+import {type StepTitleChangeHandler, useReportStepTitle} from '@app/features/auth/flow/useReportStepTitle';
 import {useMfaController} from '@app/features/auth/hooks/useLoginFlow';
 import type {LoginSuccessPayload, MfaChallenge} from '@app/features/auth/state/AuthFlow';
+import {AuthCardVariant} from '@app/features/auth/state/AuthLayoutContext';
 import {
+	AUTHENTICATOR_CODE_DESCRIPTOR,
 	BACK_TO_SIGN_IN_DESCRIPTOR,
+	BACKUP_CODE_DESCRIPTOR,
 	SIGN_IN_DESCRIPTOR,
 	TWO_FACTOR_AUTHENTICATION_DESCRIPTOR,
 } from '@app/features/i18n/utils/CommonMessageDescriptors';
@@ -15,10 +19,6 @@ import {Button} from '@app/features/ui/button/Button';
 import {msg} from '@lingui/core/macro';
 import {useLingui} from '@lingui/react/macro';
 
-const CODE_DESCRIPTOR = msg({
-	message: 'Authenticator code',
-	comment: 'Label for the MFA login one-time password field from an authenticator app or backup code.',
-});
 const AUTHENTICATION_CODE_PLACEHOLDER_DESCRIPTOR = msg({
 	message: '6-digit code',
 	comment: 'Placeholder for the MFA login one-time password field.',
@@ -35,10 +35,6 @@ const TRY_SECURITY_KEY_INSTEAD_DESCRIPTOR = msg({
 	message: 'Try security key / passkey instead',
 	comment: 'Secondary MFA action that switches from code entry to passkey or security-key authentication.',
 });
-const BACKUP_CODE_DESCRIPTOR = msg({
-	message: 'Backup code',
-	comment: 'Label and placeholder for the MFA login field when the only code the account can use is a backup code.',
-});
 const MFA_BACKUP_CODE_INSTRUCTIONS_DESCRIPTOR = msg({
 	message: "Enter one of your backup codes if you can't use your passkey.",
 	comment: 'MFA code entry instructions shown when the account uses passkeys as its second factor.',
@@ -49,26 +45,31 @@ interface MfaScreenProps {
 	inviteCode?: string;
 	onSuccess: (payload: LoginSuccessPayload) => Promise<void> | void;
 	onCancel: () => void;
+	onStepTitleChange?: StepTitleChangeHandler | null;
 }
 
-const MfaScreen = ({challenge, inviteCode, onSuccess, onCancel}: MfaScreenProps) => {
+const MfaScreen = ({challenge, inviteCode, onSuccess, onCancel, onStepTitleChange = null}: MfaScreenProps) => {
 	const {i18n} = useLingui();
+	const title = i18n._(TWO_FACTOR_AUTHENTICATION_DESCRIPTOR);
+	useReportStepTitle(onStepTitleChange, title);
 	const {form, isLoading, fieldErrors, handleWebAuthn, isWebAuthnLoading, supports} = useMfaController({
 		ticket: challenge.ticket,
 		methods: {totp: challenge.totp, webauthn: challenge.webauthn, backupCodes: challenge.backupCodes},
 		inviteCode,
 		onLoginSuccess: onSuccess,
 	});
-	useAuthCardPresentation({showLogoSide: false, variant: 'compact'});
+	useAuthPresentation({variant: AuthCardVariant.COMPACT});
 	const showCodeForm = supports.totp || supports.backupCodes;
 	const showWebAuthn = supports.webauthn;
 	const backupCodeOnly = !supports.totp;
 	const isCodePrimary = supports.totp || !showWebAuthn;
 	return (
 		<div className={styles.container} data-flx="auth.flow.mfa-screen.container--2">
-			<h1 className={styles.title} data-flx="auth.flow.mfa-screen.title">
-				{i18n._(TWO_FACTOR_AUTHENTICATION_DESCRIPTOR)}
-			</h1>
+			{onStepTitleChange == null ? (
+				<h1 className={styles.title} data-flx="auth.flow.mfa-screen.title">
+					{title}
+				</h1>
+			) : null}
 			{showCodeForm && (
 				<p className={styles.description} data-flx="auth.flow.mfa-screen.description">
 					{backupCodeOnly
@@ -98,7 +99,7 @@ const MfaScreen = ({challenge, inviteCode, onSuccess, onCancel}: MfaScreenProps)
 						data-step-focus={isCodePrimary ? 'true' : undefined}
 						required
 						placeholder={i18n._(backupCodeOnly ? BACKUP_CODE_DESCRIPTOR : AUTHENTICATION_CODE_PLACEHOLDER_DESCRIPTOR)}
-						label={i18n._(backupCodeOnly ? BACKUP_CODE_DESCRIPTOR : CODE_DESCRIPTOR)}
+						label={i18n._(backupCodeOnly ? BACKUP_CODE_DESCRIPTOR : AUTHENTICATOR_CODE_DESCRIPTOR)}
 						value={form.getValue('code')}
 						onChange={(value) => form.setValue('code', value)}
 						error={form.getError('code') || fieldErrors?.get('code') || fieldErrors?.get('ticket')}

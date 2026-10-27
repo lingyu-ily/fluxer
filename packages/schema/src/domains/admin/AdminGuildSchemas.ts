@@ -5,6 +5,8 @@ import {
 	GuildOperations,
 	GuildOperationsDescriptions,
 } from '@fluxer/constants/src/GuildConstants';
+import {CustomBadgeIdsType} from '@fluxer/schema/src/domains/admin/AdminBadgeSchemas';
+import {CommunityRemovalBasis} from '@fluxer/schema/src/domains/admin/EnforcementSchemas';
 import {GuildAuditLogListResponse} from '@fluxer/schema/src/domains/guild/GuildAuditLogSchemas';
 import {GuildBanCreateRequest} from '@fluxer/schema/src/domains/guild/GuildRequestSchemas';
 import {GuildFeatureSchema} from '@fluxer/schema/src/domains/guild/GuildResponseSchemas';
@@ -15,7 +17,7 @@ import {
 	DefaultMessageNotificationsSchema,
 	GuildExplicitContentFilterSchema,
 	GuildMFALevelSchema,
-	GuildVerificationLevelSchema,
+	GuildVerificationLevelInputSchema,
 	NSFWLevelSchema,
 } from '@fluxer/schema/src/primitives/GuildValidators';
 import {createQueryIntegerType} from '@fluxer/schema/src/primitives/QueryValidators';
@@ -102,6 +104,13 @@ export const KickGuildMemberRequest = z.object({
 
 export type KickGuildMemberRequest = z.infer<typeof KickGuildMemberRequest>;
 
+export const UnbanGuildMemberRequest = z.object({
+	guild_id: SnowflakeType,
+	user_id: SnowflakeType,
+});
+
+export type UnbanGuildMemberRequest = z.infer<typeof UnbanGuildMemberRequest>;
+
 export const GetProcessMemoryStatsQuery = z.object({
 	limit: createQueryIntegerType({defaultValue: 100, minValue: 100, maxValue: 1000}).describe(
 		'Maximum number of guild processes to return (100-1000, default 100)',
@@ -139,6 +148,12 @@ export const ClearGuildFieldsRequest = z.object({
 
 export type ClearGuildFieldsRequest = z.infer<typeof ClearGuildFieldsRequest>;
 
+export const AdminGuildDeleteRequest = z.object({
+	basis: CommunityRemovalBasis,
+});
+
+export type AdminGuildDeleteRequest = z.infer<typeof AdminGuildDeleteRequest>;
+
 export const UpdateGuildVanityRequest = z.object({
 	guild_id: SnowflakeType.describe('ID of the guild to update'),
 	vanity_url_code: VanityURLCodeType.nullable().describe('New vanity URL code, or null to remove'),
@@ -156,7 +171,7 @@ export type UpdateGuildNameRequest = z.infer<typeof UpdateGuildNameRequest>;
 export const UpdateGuildSettingsRequest = z.object({
 	guild_id: SnowflakeType.describe('ID of the guild to update'),
 	verification_level: withFieldDescription(
-		GuildVerificationLevelSchema,
+		GuildVerificationLevelInputSchema,
 		'Required verification level for guild members',
 	).optional(),
 	mfa_level: withFieldDescription(GuildMFALevelSchema, 'Required MFA level for moderators').optional(),
@@ -261,6 +276,7 @@ export const UpdateGuildRequest = UpdateGuildSettingsRequest.omit({guild_id: tru
 	new_owner_id: TransferGuildOwnershipRequest.shape.new_owner_id.optional(),
 	add_features: UpdateGuildFeaturesRequest.shape.add_features.unwrap().optional(),
 	remove_features: UpdateGuildFeaturesRequest.shape.remove_features.unwrap().optional(),
+	badge_ids: CustomBadgeIdsType.optional(),
 	fields: ClearGuildFieldsRequest.shape.fields.optional(),
 });
 

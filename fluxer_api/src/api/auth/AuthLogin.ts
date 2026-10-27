@@ -2,9 +2,11 @@
 
 import type {ApiContext} from '@app/api/ApiContext';
 import * as AuthMfa from '@app/api/auth/AuthMfa';
-import * as AuthPassword from '@app/api/auth/AuthPassword';
+import {applyPendingRecovery} from '@app/api/auth/AuthRecoveryKit';
 import * as AuthSession from '@app/api/auth/AuthSession';
 import * as AuthUtility from '@app/api/auth/AuthUtility';
+import {getLocalPartAtInstance, usernameFromInstanceLocalPart} from '@app/api/auth/InstanceAddress';
+import type {SsoService} from '@app/api/auth/services/SsoService';
 import {resolveWebAuthnSecondFactor} from '@app/api/auth/services/WebAuthnSecondFactor';
 import {
 	createInviteCode,
@@ -15,7 +17,7 @@ import {
 } from '@app/api/BrandedTypes';
 import {getContentMessage} from '@app/api/content_i18n/ContentI18n';
 import {emitActivity} from '@app/api/infrastructure/activity/ActivityEvents';
-import type {KVAccountDeletionQueueService} from '@app/api/infrastructure/KVAccountDeletionQueueService';
+import type {LoginMethod} from '@app/api/infrastructure/activity/Contract.generated';
 import {
 	REGISTRATION_PENDING_APPROVAL_TRAIT,
 	REGISTRATION_REJECTED_TRAIT,
@@ -26,10 +28,18 @@ import {createRequestCache} from '@app/api/middleware/RequestCacheMiddleware';
 import {getInstanceConfigRepository} from '@app/api/middleware/ServiceSingletons';
 import type {AuthSession as AuthSessionModel} from '@app/api/models/AuthSession';
 import type {User} from '@app/api/models/User';
+import {tierContextFromRequest} from '@app/api/user/AccountTier';
+import {findPersonByLoginHandle, type ParsedLoginHandle, parseLoginHandle} from '@app/api/user/UniqueUsernames';
+import {BELOW_MINIMUM_AGE_TRAIT} from '@app/api/user/UserTraits';
 import {lookupGeoip} from '@app/api/utils/IpUtils';
+import {verifyPassword} from '@app/api/utils/PasswordUtils';
+import * as RandomUtils from '@app/api/utils/RandomUtils';
 import {createRateLimitError} from '@app/api/utils/RateLimitUtils';
+import {requireConfiguredClientIp} from '@app/api/utils/RequestClientIp';
+import {AccountIdentityModes} from '@fluxer/constants/src/AccountIdentityConstants';
 import {UserAuthenticatorTypes, UserFlags} from '@fluxer/constants/src/UserConstants';
-import {ValidationErrorCodes} from '@fluxer/constants/src/ValidationErrorCodes';
+import {type ValidationErrorCode, ValidationErrorCodes} from '@fluxer/constants/src/ValidationErrorCodes';
+import {AccountBelowMinimumAgeError} from '@fluxer/errors/src/domains/auth/AccountBelowMinimumAgeError';
 import {IpAuthorizationRequiredError} from '@fluxer/errors/src/domains/auth/IpAuthorizationRequiredError';
 import {IpAuthorizationResendCooldownError} from '@fluxer/errors/src/domains/auth/IpAuthorizationResendCooldownError';
 import {IpAuthorizationResendLimitExceededError} from '@fluxer/errors/src/domains/auth/IpAuthorizationResendLimitExceededError';
@@ -37,10 +47,9 @@ import {MfaNotEnabledError} from '@fluxer/errors/src/domains/auth/MfaNotEnabledE
 import {RegistrationPendingApprovalError} from '@fluxer/errors/src/domains/auth/RegistrationPendingApprovalError';
 import {RegistrationRejectedError} from '@fluxer/errors/src/domains/auth/RegistrationRejectedError';
 import {InputValidationError} from '@fluxer/errors/src/domains/core/InputValidationError';
-import {UnknownUserError} from '@fluxer/errors/src/domains/user/UnknownUserError';
-import {requireClientIp} from '@fluxer/ip_utils/src/ClientIp';
 import {getSameIpDecisionKey} from '@fluxer/ip_utils/src/IpAddress';
 import type {LoginRequest} from '@fluxer/schema/src/domains/auth/AuthSchemas';
+import {EmailType} from '@fluxer/schema/src/primitives/UserValidators';
 import {formatGeoipLocation} from '@pkgs/geoip/src/GeoipLookup';
 import type {AuthenticationResponseJSON} from '@simplewebauthn/server';
 import {ms, seconds} from 'itty-time';
@@ -51,12 +60,16 @@ const DUMMY_ARGON2_HASH =
 interface LoginParams {
 	data: LoginRequest;
 	request: Request;
+	captchaVerified?: boolean;
 }
+
+export type SsoPendingLinks = Pick<SsoService, 'completePendingLink'>;
 
 interface LoginMfaTotpParams {
 	code: string;
 	ticket: string;
 	request: Request;
+	ssoLinks: SsoPendingLinks;
 }
 
 interface LoginMfaWebAuthnParams {
@@ -64,11 +77,11 @@ interface LoginMfaWebAuthnParams {
 	challenge: string;
 	ticket: string;
 	request: Request;
+	ssoLinks: SsoPendingLinks;
 }
 
 export interface LoginDependencies {
-	inviteService: InviteService | null;
-	kvDeletionQueue: KVAccountDeletionQueueService;
+	inviteService: InviteService;
 }
 
 interface LoginTokenResult {
@@ -87,10 +100,24 @@ export interface LoginMfaResult {
 
 type LoginResult = LoginTokenResult | LoginMfaResult;
 
+interface LoginIdentifierRateLimit {
+	identifier: string;
+	maxAttempts: number;
+	windowMs: number;
+}
+
+interface LoginIdentifier {
+	field: 'email' | 'login';
+	rateLimits: Array<LoginIdentifierRateLimit>;
+	sourceRateLimits: (sourceKey: string) => Array<LoginIdentifierRateLimit>;
+	failureRateLimit: LoginIdentifierRateLimit | null;
+	invalidCode: ValidationErrorCode;
+	lookup: () => Promise<User | null>;
+}
+
 export interface IpAuthorizationTicketCache {
 	userId: string;
 	email: string;
-	username: string;
 	origin: AuthSession.SessionOrigin;
 	authToken: string;
 	clientLocation: string;
@@ -108,10 +135,15 @@ function getTokenCacheKey(token: string): string {
 	return `ip-auth-token:${token}`;
 }
 
-function emitLogin(user: User, ok: boolean, details: {failure?: string; mfa?: boolean; newIp?: boolean} = {}): void {
+export function emitLogin(
+	user: User,
+	ok: boolean,
+	details: {failure?: string; mfa?: boolean; newIp?: boolean; method?: LoginMethod} = {},
+): void {
 	void emitActivity('login', user.id.toString(), {
 		user_id: user.id.toString(),
 		ok,
+		method: details.method ?? 'password',
 		failure: details.failure ?? null,
 		mfa: details.mfa ?? false,
 		new_ip: details.newIp ?? false,
@@ -139,12 +171,10 @@ export async function resendIpAuthorization(
 	if (secondsSinceCreation < minDelay) {
 		throw new IpAuthorizationResendCooldownError(minDelay - secondsSinceCreation);
 	}
-	await email.sendIpAuthorizationEmail(
+	await email.send(
+		'ip_authorization',
 		payload.email,
-		payload.username,
-		payload.authToken,
-		payload.origin.ip,
-		payload.clientLocation,
+		{authorizationToken: payload.authToken, ipAddress: payload.origin.ip, location: payload.clientLocation},
 		payload.locale ?? null,
 	);
 	const ttl = await cache.ttl(cacheKey);
@@ -179,13 +209,15 @@ export async function completeIpAuthorization(
 	if (!payload) {
 		throw InputValidationError.fromCode('token', ValidationErrorCodes.INVALID_OR_EXPIRED_AUTHORIZATION_TOKEN);
 	}
-	const repoResult = await AuthUtility.authorizeIpByToken(ctx, token);
-	if (!repoResult || repoResult.userId.toString() !== payload.userId) {
+	const user = await users.findUniqueAssert(createUserID(BigInt(payload.userId)));
+	if (user.passwordLastChangedAt !== null && payload.createdAt < user.passwordLastChangedAt.getTime()) {
+		await cache.delete(cacheKey);
+		await cache.delete(getTokenCacheKey(token));
 		throw InputValidationError.fromCode('token', ValidationErrorCodes.INVALID_OR_EXPIRED_AUTHORIZATION_TOKEN);
 	}
-	const user = await users.findUnique(createUserID(BigInt(payload.userId)));
-	if (!user) {
-		throw new UnknownUserError();
+	const repoResult = await ctx.services.users.authorizeIpByToken(token);
+	if (!repoResult || repoResult.userId.toString() !== payload.userId) {
+		throw InputValidationError.fromCode('token', ValidationErrorCodes.INVALID_OR_EXPIRED_AUTHORIZATION_TOKEN);
 	}
 	AuthUtility.assertNonBotUser(ctx, user);
 	await users.createAuthorizedIp(user.id, payload.origin.ip);
@@ -199,72 +231,98 @@ export async function completeIpAuthorization(
 export async function login(
 	ctx: ApiContext,
 	deps: LoginDependencies,
-	{data, request}: LoginParams,
+	{data, request, captchaVerified = false}: LoginParams,
 ): Promise<LoginResult> {
 	const {users, cache, rateLimit, email, config} = ctx.services;
-	const {inviteService, kvDeletionQueue} = deps;
+	const {inviteService} = deps;
 	const skipRateLimits = config.dev.testModeEnabled || config.dev.disableRateLimits;
-	const emailRateLimit = await rateLimit.checkLimit({
-		identifier: `login:email:${data.email.toLowerCase()}`,
-		maxAttempts: 5,
-		windowMs: ms('15 minutes'),
-	});
-	if (!emailRateLimit.allowed && !skipRateLimits) {
-		throw createRateLimitError(emailRateLimit);
-	}
-	const clientIp = requireClientIp(request, {
-		trustClientIpHeader: config.proxy.trust_client_ip_header,
-		clientIpHeaderName: config.proxy.client_ip_header,
-	});
-	const ipRateLimit = await rateLimit.checkLimit({
-		identifier: `login:ip:${getSameIpDecisionKey(clientIp) ?? clientIp}`,
-		maxAttempts: 10,
-		windowMs: ms('30 minutes'),
-	});
-	if (!ipRateLimit.allowed && !skipRateLimits) {
-		throw createRateLimitError(ipRateLimit);
-	}
-	const user = await users.findByEmail(data.email);
-	if (!user) {
-		throw InputValidationError.fromCodes([
-			{path: 'email', code: ValidationErrorCodes.INVALID_EMAIL_OR_PASSWORD},
-			{path: 'password', code: ValidationErrorCodes.INVALID_EMAIL_OR_PASSWORD},
+	const identifier = await resolveLoginIdentifier(ctx, data);
+	const invalidCredentials = () =>
+		InputValidationError.fromCodes([
+			{path: identifier.field, code: identifier.invalidCode},
+			{path: 'password', code: identifier.invalidCode},
 		]);
+	const enforceRateLimits = async (limits: Array<LoginIdentifierRateLimit>) => {
+		for (const limit of limits) {
+			const result = await rateLimit.checkLimit(limit);
+			if (!result.allowed && !skipRateLimits) {
+				throw createRateLimitError(result);
+			}
+		}
+	};
+	await enforceRateLimits(identifier.rateLimits);
+	const clientIp = requireConfiguredClientIp(request, config.proxy);
+	const sourceKey = getSameIpDecisionKey(clientIp) ?? clientIp;
+	await enforceRateLimits(identifier.sourceRateLimits(sourceKey));
+	const ipFailureLimit = {identifier: `login:ip:${sourceKey}`, maxAttempts: 10, windowMs: ms('30 minutes')};
+	const ipFailureState = await rateLimit.peekLimit(ipFailureLimit);
+	if (!ipFailureState.allowed && !skipRateLimits) {
+		throw createRateLimitError(ipFailureState);
+	}
+	const failureLimit = identifier.failureRateLimit;
+	const failureState = failureLimit ? await rateLimit.peekLimit(failureLimit) : null;
+	const failureLockout =
+		failureLimit && failureState !== null && failureState.remaining === 0 && !skipRateLimits
+			? {
+					...failureState,
+					allowed: false,
+					retryAfter: Math.ceil(failureLimit.windowMs / failureLimit.maxAttempts / 1000),
+				}
+			: null;
+	if (failureLockout && ctx.request.blockedNetworkSignIn) {
+		throw createRateLimitError(failureLockout);
+	}
+	const rejectCredentials = async (): Promise<never> => {
+		await rateLimit.checkLimit(ipFailureLimit);
+		if (failureLimit) {
+			await rateLimit.checkLimit(failureLimit);
+		}
+		if (failureLockout) {
+			throw createRateLimitError(failureLockout);
+		}
+		AuthUtility.assertNetworkAllowed(ctx);
+		throw invalidCredentials();
+	};
+	const user = await identifier.lookup();
+	if (!user) {
+		if (identifier.invalidCode === ValidationErrorCodes.INVALID_LOGIN_OR_PASSWORD) {
+			await verifyPassword({password: data.password, passwordHash: DUMMY_ARGON2_HASH});
+		}
+		return await rejectCredentials();
 	}
 	AuthUtility.assertNonBotUser(ctx, user);
 	if (!user.passwordHash) {
-		await AuthPassword.verifyPassword(ctx, {password: data.password, passwordHash: DUMMY_ARGON2_HASH});
+		await verifyPassword({password: data.password, passwordHash: DUMMY_ARGON2_HASH});
 		emitLogin(user, false, {failure: 'no_password'});
-		throw InputValidationError.fromCodes([
-			{path: 'email', code: ValidationErrorCodes.INVALID_EMAIL_OR_PASSWORD},
-			{path: 'password', code: ValidationErrorCodes.INVALID_EMAIL_OR_PASSWORD},
-		]);
+		return await rejectCredentials();
 	}
-	const isMatch = await AuthPassword.verifyPassword(ctx, {
+	const isMatch = await verifyPassword({
 		password: data.password,
 		passwordHash: user.passwordHash,
 	});
 	if (!isMatch) {
 		emitLogin(user, false, {failure: 'bad_password'});
-		throw InputValidationError.fromCodes([
-			{path: 'email', code: ValidationErrorCodes.INVALID_EMAIL_OR_PASSWORD},
-			{path: 'password', code: ValidationErrorCodes.INVALID_EMAIL_OR_PASSWORD},
-		]);
+		return await rejectCredentials();
 	}
-	const currentUser = await AuthUtility.reactivateOnSignIn(
-		ctx,
-		await AuthUtility.handleBanStatus(ctx, user),
-		kvDeletionQueue,
-	);
+	if (failureLockout && !captchaVerified && !(await users.checkIpAuthorized(user.id, clientIp))) {
+		throw createRateLimitError(failureLockout);
+	}
+	const hasMfa =
+		user.authenticatorTypes.has(UserAuthenticatorTypes.TOTP) ||
+		user.authenticatorTypes.has(UserAuthenticatorTypes.WEBAUTHN);
+	if (hasMfa) {
+		AuthUtility.assertMfaTicketAllowed(ctx, user);
+	}
+	const currentUser = hasMfa ? user : await AuthUtility.assertSignInAllowed(ctx, user);
 	if (currentUser.traits.has(REGISTRATION_PENDING_APPROVAL_TRAIT)) {
 		throw new RegistrationPendingApprovalError();
 	}
 	if (currentUser.traits.has(REGISTRATION_REJECTED_TRAIT)) {
 		throw new RegistrationRejectedError();
 	}
-	const hasMfa =
-		currentUser.authenticatorTypes.has(UserAuthenticatorTypes.TOTP) ||
-		currentUser.authenticatorTypes.has(UserAuthenticatorTypes.WEBAUTHN);
+	if (currentUser.traits.has(BELOW_MINIMUM_AGE_TRAIT)) {
+		throw new AccountBelowMinimumAgeError();
+	}
 	const isAppStoreReviewer = (currentUser.flags & UserFlags.APP_STORE_REVIEWER) !== 0n;
 	let newIp = false;
 	if (!hasMfa && !isAppStoreReviewer) {
@@ -279,8 +337,8 @@ export async function login(
 			if (integrationsConfig.email.disable_new_ip_authorization || !effectiveEmailConfig.enabled) {
 				await users.createAuthorizedIp(currentUser.id, clientIp);
 			} else {
-				const ticket = createIpAuthorizationTicket(await AuthUtility.generateSecureToken(ctx));
-				const authToken = createIpAuthorizationToken(await AuthUtility.generateSecureToken(ctx));
+				const ticket = createIpAuthorizationTicket(await RandomUtils.randomString(64));
+				const authToken = createIpAuthorizationToken(await RandomUtils.randomString(64));
 				const geoipResult = await lookupGeoip(clientIp);
 				const clientLocation =
 					formatGeoipLocation(geoipResult, currentUser.locale) ??
@@ -288,7 +346,6 @@ export async function login(
 				const cachePayload: IpAuthorizationTicketCache = {
 					userId: currentUser.id.toString(),
 					email: currentUser.email!,
-					username: currentUser.username,
 					origin: AuthSession.resolveSessionOrigin(ctx, request),
 					authToken,
 					clientLocation,
@@ -303,12 +360,10 @@ export async function login(
 					ticket: string;
 				}>(`ip-auth-token:${authToken}`, {ticket}, ttlSeconds);
 				await users.createIpAuthorizationToken(currentUser.id, authToken, currentUser.email!);
-				await email.sendIpAuthorizationEmail(
+				await email.send(
+					'ip_authorization',
 					currentUser.email!,
-					currentUser.username,
-					authToken,
-					clientIp,
-					clientLocation,
+					{authorizationToken: authToken, ipAddress: clientIp, location: clientLocation},
 					currentUser.locale,
 				);
 				emitLogin(currentUser, false, {failure: 'ip_authorization_required', newIp: true});
@@ -324,12 +379,13 @@ export async function login(
 		const webauthnIsSecondFactor = await resolveWebAuthnSecondFactor(ctx, currentUser);
 		return await createMfaTicketResponse(ctx, currentUser, webauthnIsSecondFactor);
 	}
-	if (data.invite_code && inviteService) {
+	if (data.invite_code) {
 		try {
 			await inviteService.acceptInvite({
 				userId: currentUser.id,
 				inviteCode: createInviteCode(data.invite_code),
 				requestCache: createRequestCache(),
+				tierContext: tierContextFromRequest(request),
 			});
 		} catch (error) {
 			Logger.warn({inviteCode: data.invite_code, error}, 'Failed to auto-join invite on login');
@@ -344,6 +400,67 @@ export async function login(
 		user_id: currentUser.id.toString(),
 		token,
 	};
+}
+
+function emailLoginRateLimits(emailAddress: string): Array<LoginIdentifierRateLimit> {
+	return [{identifier: `login:email:${emailAddress.toLowerCase()}`, maxAttempts: 5, windowMs: ms('15 minutes')}];
+}
+
+async function resolveLoginIdentifier(ctx: ApiContext, data: LoginRequest): Promise<LoginIdentifier> {
+	const {users} = ctx.services;
+	const mode = await getInstanceConfigRepository().getAccountIdentityMode();
+	if (mode === AccountIdentityModes.USERNAME) {
+		const field = data.email !== undefined ? 'email' : 'login';
+		const input = (field === 'email' ? data.email : data.login) ?? '';
+		const handle = field === 'email' ? parseOlderAppLoginHandle(ctx, input) : parseLoginHandle(input);
+		return {
+			field,
+			rateLimits: [],
+			sourceRateLimits: (sourceKey) => {
+				if (!handle) {
+					return [{identifier: `login:id-unparsed:${sourceKey}`, maxAttempts: 5, windowMs: ms('15 minutes')}];
+				}
+				const lowered = handle.username.toLowerCase();
+				return [{identifier: `login:id:${lowered}:${sourceKey}`, maxAttempts: 5, windowMs: ms('15 minutes')}];
+			},
+			failureRateLimit: handle
+				? {identifier: `login:id:${handle.username.toLowerCase()}`, maxAttempts: 100, windowMs: ms('1 hour')}
+				: null,
+			invalidCode: ValidationErrorCodes.INVALID_LOGIN_OR_PASSWORD,
+			lookup: async () => (handle ? await findPersonByLoginHandle(users, handle) : null),
+		};
+	}
+	if (data.email !== undefined) {
+		const emailAddress = data.email;
+		return {
+			field: 'email',
+			rateLimits: emailLoginRateLimits(emailAddress),
+			sourceRateLimits: () => [],
+			failureRateLimit: null,
+			invalidCode: ValidationErrorCodes.INVALID_EMAIL_OR_PASSWORD,
+			lookup: () => users.findByEmail(emailAddress),
+		};
+	}
+	const parsedEmail = EmailType.safeParse(data.login);
+	if (!parsedEmail.success) {
+		throw InputValidationError.fromCode('login', ValidationErrorCodes.INVALID_EMAIL_FORMAT);
+	}
+	const emailAddress = parsedEmail.data;
+	return {
+		field: 'login',
+		rateLimits: emailLoginRateLimits(emailAddress),
+		sourceRateLimits: () => [],
+		failureRateLimit: null,
+		invalidCode: ValidationErrorCodes.INVALID_EMAIL_OR_PASSWORD,
+		lookup: () => users.findByEmail(emailAddress),
+	};
+}
+
+function parseOlderAppLoginHandle(ctx: ApiContext, input: string): ParsedLoginHandle | null {
+	if (!input.includes('@')) return parseLoginHandle(input);
+	const localPart = getLocalPartAtInstance(ctx.services.config, input.trim());
+	const username = localPart === null ? null : usernameFromInstanceLocalPart(localPart);
+	return username === null ? null : parseLoginHandle(username);
 }
 
 const MFA_TICKET_MAX_ATTEMPTS = 5;
@@ -375,18 +492,9 @@ export async function consumeMfaAttempt(
 
 export async function loginMfaTotp(
 	ctx: ApiContext,
-	{code, ticket, request}: LoginMfaTotpParams,
+	{code, ticket, request, ssoLinks}: LoginMfaTotpParams,
 ): Promise<LoginTokenResult> {
-	const {users, cache} = ctx.services;
-	const userId = await cache.get<string>(`mfa-ticket:${ticket}`);
-	if (!userId) {
-		throw InputValidationError.fromCode('ticket', ValidationErrorCodes.SESSION_TIMEOUT);
-	}
-	const user = await users.findUnique(createUserID(BigInt(userId)));
-	if (!user) {
-		throw new UnknownUserError();
-	}
-	AuthUtility.assertNonBotUser(ctx, user);
+	const user = await requireMfaTicketUser(ctx, ticket);
 	const hasTotp = Boolean(user.totpSecret) && user.authenticatorTypes.has(UserAuthenticatorTypes.TOTP);
 	if (!hasTotp && !(await AuthMfa.hasUnconsumedBackupCodes(ctx, user.id))) {
 		throw InputValidationError.fromCode('code', ValidationErrorCodes.TOTP_NOT_ENABLED);
@@ -401,7 +509,7 @@ export async function loginMfaTotp(
 	if (!isValid) {
 		throw InputValidationError.fromCode('code', ValidationErrorCodes.INVALID_CODE);
 	}
-	const [token] = await completeMfaLogin(ctx, user, ticket, request);
+	const [token] = await completeMfaLogin(ctx, user, ticket, request, ssoLinks);
 	return {user_id: user.id.toString(), token};
 }
 
@@ -418,47 +526,55 @@ export async function completeMfaLogin(
 	user: User,
 	ticket: string,
 	request: Request,
+	ssoLinks: SsoPendingLinks,
 ): Promise<[token: string, AuthSessionModel]> {
 	const {cache, rateLimit} = ctx.services;
+	const sessionUser = await ssoLinks.completePendingLink(await applyPendingRecovery(ctx, user, ticket), ticket);
+	if (await cache.get<boolean>(mfaTicketNetworkKey(ticket))) {
+		await cache.delete(mfaTicketNetworkKey(ticket));
+		await ctx.services.users.createAuthorizedIp(
+			sessionUser.id,
+			requireConfiguredClientIp(request, ctx.services.config.proxy),
+		);
+	}
 	await cache.delete(`mfa-ticket:${ticket}`);
 	await rateLimit.resetLimit(`mfa:ticket:${ticket}`);
 	await rateLimit.resetLimit(`mfa:user:${user.id}`);
-	const session = await createLoginSession(ctx, user, request);
-	emitLogin(user, true, {mfa: true});
+	const session = await createLoginSession(ctx, sessionUser, request);
+	emitLogin(sessionUser, true, {mfa: true});
 	return session;
 }
 
 export async function loginMfaWebAuthn(
 	ctx: ApiContext,
-	{response, challenge, ticket, request}: LoginMfaWebAuthnParams,
+	{response, challenge, ticket, request, ssoLinks}: LoginMfaWebAuthnParams,
 ): Promise<LoginTokenResult> {
-	const {users, cache} = ctx.services;
-	const userId = await cache.get<string>(`mfa-ticket:${ticket}`);
-	if (!userId) {
-		throw InputValidationError.fromCode('ticket', ValidationErrorCodes.SESSION_TIMEOUT);
-	}
-	const user = await users.findUnique(createUserID(BigInt(userId)));
-	if (!user) {
-		throw new UnknownUserError();
-	}
-	AuthUtility.assertNonBotUser(ctx, user);
+	const user = await requireMfaTicketUser(ctx, ticket);
 	if (!(await resolveWebAuthnSecondFactor(ctx, user))) {
 		throw new MfaNotEnabledError();
 	}
 	await consumeMfaAttempt(ctx, {userId: user.id.toString(), ticket, field: 'ticket'});
 	await AuthMfa.verifyWebAuthnAuthentication(ctx, user.id, response, challenge, 'mfa', ticket);
-	const [token] = await completeMfaLogin(ctx, user, ticket, request);
+	const [token] = await completeMfaLogin(ctx, user, ticket, request, ssoLinks);
 	return {user_id: user.id.toString(), token};
+}
+
+function mfaTicketNetworkKey(ticket: string): string {
+	return `mfa-ticket-network:${ticket}`;
 }
 
 export async function createMfaTicketResponse(
 	ctx: ApiContext,
 	user: User,
 	webauthnIsSecondFactor: boolean,
+	options: {authorizeNetwork?: boolean} = {},
 ): Promise<LoginMfaResult> {
 	const {cache} = ctx.services;
-	const ticket = createMfaTicket(await AuthUtility.generateSecureToken(ctx));
+	const ticket = createMfaTicket(await RandomUtils.randomString(64));
 	await cache.set(`mfa-ticket:${ticket}`, user.id.toString(), seconds('5 minutes'));
+	if (options.authorizeNetwork) {
+		await cache.set(mfaTicketNetworkKey(ticket), true, seconds('5 minutes'));
+	}
 	const hasTotp = user.authenticatorTypes.has(UserAuthenticatorTypes.TOTP);
 	const hasBackupCodes = await AuthMfa.hasUnconsumedBackupCodes(ctx, user.id);
 	const allowedMethods: Array<string> = [];
@@ -473,4 +589,14 @@ export async function createMfaTicketResponse(
 		webauthn: webauthnIsSecondFactor,
 		backup_codes: hasBackupCodes,
 	};
+}
+
+export async function requireMfaTicketUser(ctx: ApiContext, ticket: string, expectedUserId?: string): Promise<User> {
+	const userId = await ctx.services.cache.get<string>(`mfa-ticket:${ticket}`);
+	if (!userId || (expectedUserId !== undefined && userId !== expectedUserId)) {
+		throw InputValidationError.fromCode('ticket', ValidationErrorCodes.SESSION_TIMEOUT);
+	}
+	const user = await ctx.services.users.findUniqueAssert(createUserID(BigInt(userId)));
+	AuthUtility.assertNonBotUser(ctx, user);
+	return user;
 }

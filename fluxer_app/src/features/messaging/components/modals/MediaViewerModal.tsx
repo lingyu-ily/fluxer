@@ -10,6 +10,7 @@ import {
 	requestMessageReply,
 } from '@app/features/channel/components/MessageActionUtils';
 import type {Channel} from '@app/features/channel/models/Channel';
+import {isMediaDownloadHidden} from '@app/features/forum/utils/MediaDownloadPolicy';
 import * as MessageCommands from '@app/features/messaging/commands/MessageCommands';
 import type {ForwardModalSuccess} from '@app/features/messaging/components/modals/ForwardModal';
 import {MediaModal} from '@app/features/messaging/components/modals/MediaModal';
@@ -398,56 +399,46 @@ const MediaViewerModalComponent: FC = observer(() => {
 		},
 		[currentIndex],
 	);
+	const renderMediaMenu = useCallback(
+		(item: MediaViewerItem, menuMessage: Message) =>
+			({onClose}: {onClose: () => void}) => (
+				<MediaContextMenu
+					message={menuMessage}
+					sourceChannel={sourceChannel}
+					originalSrc={item.originalSrc}
+					proxyURL={item.src}
+					type={item.type}
+					contentHash={item.contentHash}
+					attachmentId={item.attachmentId}
+					embedIndex={item.embedIndex}
+					defaultName={defaultName}
+					naturalWidth={item.naturalWidth}
+					naturalHeight={item.naturalHeight}
+					onClose={onClose}
+					onDelete={handleDelete}
+					data-flx="messaging.media-viewer-modal.render-media-menu.media-context-menu"
+				/>
+			),
+		[defaultName, handleDelete, sourceChannel],
+	);
 	const handleContextMenu = useCallback(
 		(event: MouseEvent<HTMLDivElement>) => {
 			if (!currentItem || !message) return;
-			const renderMenu = ({onClose}: {onClose: () => void}) => (
-				<MediaContextMenu
-					message={message}
-					sourceChannel={sourceChannel}
-					originalSrc={currentItem.originalSrc}
-					proxyURL={currentItem.src}
-					type={currentItem.type}
-					contentHash={currentItem.contentHash}
-					attachmentId={currentItem.attachmentId}
-					embedIndex={currentItem.embedIndex}
-					defaultName={defaultName}
-					naturalWidth={currentItem.naturalWidth}
-					naturalHeight={currentItem.naturalHeight}
-					onClose={onClose}
-					onDelete={handleDelete}
-					data-flx="messaging.media-viewer-modal.render-menu.media-context-menu"
-				/>
-			);
-			ContextMenuCommands.openFromEvent(event, renderMenu);
+			ContextMenuCommands.openFromEvent(event, renderMediaMenu(currentItem, message));
 		},
-		[currentItem, defaultName, handleDelete, message, sourceChannel],
+		[currentItem, message, renderMediaMenu],
 	);
 	const handleMenuOpen = useCallback(() => {
 		if (!currentItem || !message) return;
 		if (isMobile) {
 			setIsMediaMenuOpen(true);
 		} else {
-			ContextMenuCommands.openAtPoint({x: window.innerWidth / 2, y: window.innerHeight / 2}, ({onClose}) => (
-				<MediaContextMenu
-					message={message}
-					sourceChannel={sourceChannel}
-					originalSrc={currentItem.originalSrc}
-					proxyURL={currentItem.src}
-					type={currentItem.type}
-					contentHash={currentItem.contentHash}
-					attachmentId={currentItem.attachmentId}
-					embedIndex={currentItem.embedIndex}
-					defaultName={defaultName}
-					naturalWidth={currentItem.naturalWidth}
-					naturalHeight={currentItem.naturalHeight}
-					onClose={onClose}
-					onDelete={handleDelete}
-					data-flx="messaging.media-viewer-modal.handle-menu-open.media-context-menu"
-				/>
-			));
+			ContextMenuCommands.openAtPoint(
+				{x: window.innerWidth / 2, y: window.innerHeight / 2},
+				renderMediaMenu(currentItem, message),
+			);
 		}
-	}, [currentItem, defaultName, handleDelete, message, sourceChannel, isMobile]);
+	}, [currentItem, message, renderMediaMenu, isMobile]);
 	const permissions = useMemo(
 		() => (message ? untracked(() => getMessagePermissions(message, sourceChannel)) : null),
 		[message, sourceChannel],
@@ -674,6 +665,7 @@ const MediaViewerModalComponent: FC = observer(() => {
 			/>
 		);
 	};
+	const downloadHidden = isMediaDownloadHidden(channelId ?? message?.channelId, currentItem.type);
 	const canFavoriteCurrentItem =
 		Boolean(channelId) &&
 		Boolean(messageId) &&
@@ -698,10 +690,10 @@ const MediaViewerModalComponent: FC = observer(() => {
 				dimensions={dimensions}
 				isFavorited={canFavoriteCurrentItem ? isFavorited : undefined}
 				onFavorite={canFavoriteCurrentItem ? handleFavoriteClick : undefined}
-				onDownload={handleDownload}
-				onOpenInBrowser={handleOpenInBrowser}
-				onCopyLink={handleCopyLink}
-				onCopyMedia={handleCopyMedia}
+				onDownload={downloadHidden ? undefined : handleDownload}
+				onOpenInBrowser={downloadHidden ? undefined : handleOpenInBrowser}
+				onCopyLink={downloadHidden ? undefined : handleCopyLink}
+				onCopyMedia={downloadHidden ? undefined : handleCopyMedia}
 				onDeleteAttachment={deletableAttachmentId ? handleDeleteAttachment : undefined}
 				onReply={permissions?.canSendMessages ? handleReply : undefined}
 				onForward={canForwardCurrentMedia ? handleForward : undefined}
@@ -715,7 +707,7 @@ const MediaViewerModalComponent: FC = observer(() => {
 				providerName={currentItem.providerName}
 				videoSrc={currentItem.type === 'video' ? currentItem.src : undefined}
 				initialTime={currentItem.initialTime}
-				mediaType={currentItem.type === 'audio' ? 'audio' : currentItem.type === 'video' ? 'video' : 'image'}
+				mediaType={currentItem.type === 'audio' || currentItem.type === 'video' ? currentItem.type : 'image'}
 				onMenuOpen={handleMenuOpen}
 				data-flx="messaging.media-viewer-modal.media-viewer-modal-component.media-modal"
 			>

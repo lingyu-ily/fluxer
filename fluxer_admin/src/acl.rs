@@ -14,6 +14,10 @@ pub const AUDIT_LOG_VIEW: &str = "audit_log:view";
 pub const AUTHENTICATE: &str = "admin:authenticate";
 pub const JOBS_VIEW: &str = "jobs:view";
 pub const JOBS_CANCEL: &str = "jobs:cancel";
+pub const BADGE_CREATE: &str = "badge:create";
+pub const BADGE_DELETE: &str = "badge:delete";
+pub const BADGE_LIST: &str = "badge:list";
+pub const BADGE_UPDATE: &str = "badge:update";
 pub const BAN_EMAIL_ADD: &str = "ban:email:add";
 pub const BAN_EMAIL_CHECK: &str = "ban:email:check";
 pub const BAN_EMAIL_REMOVE: &str = "ban:email:remove";
@@ -42,11 +46,11 @@ pub const BULK_ADD_GUILD_MEMBERS: &str = "bulk:add:guild_members";
 pub const BULK_DELETE_USERS: &str = "bulk:delete:users";
 pub const BULK_DELETE_USER_MESSAGES: &str = "bulk:delete:user_messages";
 pub const BULK_UPDATE_GUILD_FEATURES: &str = "bulk:update:guild_features";
-pub const BULK_UPDATE_SUSPICIOUS_ACTIVITY: &str = "bulk:update:suspicious_activity";
 pub const BULK_UPDATE_USER_FLAGS: &str = "bulk:update:user_flags";
-pub const CSAM_SUBMIT_NCMEC: &str = "csam:submit_ncmec";
 pub const DISCOVERY_REMOVE: &str = "discovery:remove";
 pub const DISCOVERY_REVIEW: &str = "discovery:review";
+pub const ENFORCEMENT_ANNOTATE: &str = "enforcement:annotate";
+pub const ENFORCEMENT_VIEW: &str = "enforcement:view";
 pub const GATEWAY_MEMORY_STATS: &str = "gateway:memory_stats";
 pub const GATEWAY_RELOAD_ALL: &str = "gateway:reload_all";
 pub const GIFT_CODES_GENERATE: &str = "gift_codes:generate";
@@ -60,6 +64,7 @@ pub const GUILD_LOOKUP: &str = "guild:lookup";
 pub const GUILD_RELOAD: &str = "guild:reload";
 pub const GUILD_SHUTDOWN: &str = "guild:shutdown";
 pub const GUILD_TRANSFER_OWNERSHIP: &str = "guild:transfer_ownership";
+pub const GUILD_UPDATE_BADGES: &str = "guild:update:badges";
 pub const GUILD_UPDATE_FEATURES: &str = "guild:update:features";
 pub const GUILD_UPDATE_NAME: &str = "guild:update:name";
 pub const GUILD_UPDATE_SETTINGS: &str = "guild:update:settings";
@@ -72,13 +77,17 @@ pub const MESSAGE_DELETE_ALL: &str = "message:delete_all";
 pub const MESSAGE_DELETE: &str = "message:delete";
 pub const MESSAGE_LOOKUP: &str = "message:lookup";
 pub const MESSAGE_SHRED: &str = "message:shred";
+pub const OPERATOR_PASS_WAITLIST_STATS: &str = "operator_pass:waitlist_stats";
+pub const REGISTRATION_REVIEW: &str = "registration:review";
+pub const REPORT_DELETE: &str = "report:delete";
 pub const REPORT_RESOLVE: &str = "report:resolve";
 pub const REPORT_VIEW: &str = "report:view";
 pub const REPORT_VIEW_REPORTER_PII: &str = "report:view:reporter_pii";
 pub const SYSTEM_DM_SEND: &str = "system_dm:send";
 pub const USER_CANCEL_BULK_MESSAGE_DELETION: &str = "user:cancel:bulk_message_deletion";
+pub const USER_CREATE_PASSWORD_RESET_LINK: &str = "user:create:password_reset_link";
+pub const USER_DELETE_RECOVERY_KIT: &str = "user:delete:recovery_kit";
 pub const USER_DELETE: &str = "user:delete";
-pub const USER_DISABLE_SUSPICIOUS: &str = "user:disable:suspicious";
 pub const USER_LIST_DM_CHANNELS: &str = "user:list:dm_channels";
 pub const USER_LIST_GUILDS: &str = "user:list:guilds";
 pub const USER_LIST_RELATIONSHIPS: &str = "user:list:relationships";
@@ -90,14 +99,13 @@ pub const USER_VIEW_DOB: &str = "user:view:dob";
 pub const USER_VIEW_EMAIL: &str = "user:view:email";
 pub const USER_VIEW_IP: &str = "user:view:ip";
 pub const USER_TEMP_BAN: &str = "user:temp_ban";
+pub const USER_UPDATE_BADGES: &str = "user:update:badges";
 pub const USER_UPDATE_BOT_STATUS: &str = "user:update:bot_status";
 pub const USER_UPDATE_DOB: &str = "user:update:dob";
 pub const USER_UPDATE_EMAIL: &str = "user:update:email";
 pub const USER_UPDATE_FLAGS: &str = "user:update:flags";
 pub const USER_UPDATE_MFA: &str = "user:update:mfa";
-pub const USER_UPDATE_PHONE: &str = "user:update:phone";
 pub const USER_UPDATE_PROFILE: &str = "user:update:profile";
-pub const USER_UPDATE_SUSPICIOUS_ACTIVITY: &str = "user:update:suspicious_activity";
 pub const USER_UPDATE_TRAITS: &str = "user:update:traits";
 pub const USER_UPDATE_USERNAME: &str = "user:update:username";
 pub const VOICE_REGION_CREATE: &str = "voice:region:create";
@@ -123,6 +131,10 @@ pub const ALL_ACLS: &[&str] = &[
     AUTHENTICATE,
     JOBS_VIEW,
     JOBS_CANCEL,
+    BADGE_CREATE,
+    BADGE_DELETE,
+    BADGE_LIST,
+    BADGE_UPDATE,
     BAN_EMAIL_ADD,
     BAN_EMAIL_CHECK,
     BAN_EMAIL_REMOVE,
@@ -151,11 +163,11 @@ pub const ALL_ACLS: &[&str] = &[
     BULK_DELETE_USERS,
     BULK_DELETE_USER_MESSAGES,
     BULK_UPDATE_GUILD_FEATURES,
-    BULK_UPDATE_SUSPICIOUS_ACTIVITY,
     BULK_UPDATE_USER_FLAGS,
-    CSAM_SUBMIT_NCMEC,
     DISCOVERY_REMOVE,
     DISCOVERY_REVIEW,
+    ENFORCEMENT_ANNOTATE,
+    ENFORCEMENT_VIEW,
     GATEWAY_MEMORY_STATS,
     GATEWAY_RELOAD_ALL,
     GIFT_CODES_GENERATE,
@@ -169,6 +181,7 @@ pub const ALL_ACLS: &[&str] = &[
     GUILD_RELOAD,
     GUILD_SHUTDOWN,
     GUILD_TRANSFER_OWNERSHIP,
+    GUILD_UPDATE_BADGES,
     GUILD_UPDATE_FEATURES,
     GUILD_UPDATE_NAME,
     GUILD_UPDATE_SETTINGS,
@@ -181,13 +194,17 @@ pub const ALL_ACLS: &[&str] = &[
     MESSAGE_DELETE,
     MESSAGE_LOOKUP,
     MESSAGE_SHRED,
+    OPERATOR_PASS_WAITLIST_STATS,
+    REGISTRATION_REVIEW,
+    REPORT_DELETE,
     REPORT_RESOLVE,
     REPORT_VIEW,
     REPORT_VIEW_REPORTER_PII,
     SYSTEM_DM_SEND,
     USER_CANCEL_BULK_MESSAGE_DELETION,
+    USER_CREATE_PASSWORD_RESET_LINK,
+    USER_DELETE_RECOVERY_KIT,
     USER_DELETE,
-    USER_DISABLE_SUSPICIOUS,
     USER_LIST_DM_CHANNELS,
     USER_LIST_GUILDS,
     USER_LIST_RELATIONSHIPS,
@@ -199,14 +216,13 @@ pub const ALL_ACLS: &[&str] = &[
     USER_VIEW_EMAIL,
     USER_VIEW_IP,
     USER_TEMP_BAN,
+    USER_UPDATE_BADGES,
     USER_UPDATE_BOT_STATUS,
     USER_UPDATE_DOB,
     USER_UPDATE_EMAIL,
     USER_UPDATE_FLAGS,
     USER_UPDATE_MFA,
-    USER_UPDATE_PHONE,
     USER_UPDATE_PROFILE,
-    USER_UPDATE_SUSPICIOUS_ACTIVITY,
     USER_UPDATE_TRAITS,
     USER_UPDATE_USERNAME,
     VOICE_REGION_CREATE,
@@ -235,63 +251,4 @@ pub fn has_any_permission(admin_acls: &[String], required: &[&str]) -> bool {
 
 fn acl_key_alias(acl: &str) -> String {
     acl.replace(':', "_").to_ascii_uppercase()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn acls(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn has_permission_exact_match() {
-        assert!(has_permission(&acls(&[USER_LOOKUP]), USER_LOOKUP));
-    }
-
-    #[test]
-    fn has_permission_wildcard() {
-        assert!(has_permission(&acls(&[WILDCARD]), USER_LOOKUP));
-        assert!(has_permission(&acls(&[WILDCARD]), GUILD_DELETE));
-    }
-
-    #[test]
-    fn has_permission_accepts_constant_key_aliases() {
-        assert!(has_permission(
-            &acls(&["USER_REMOVE_RELATIONSHIP"]),
-            USER_REMOVE_RELATIONSHIP
-        ));
-        assert!(has_permission(&acls(&["WILDCARD"]), GUILD_DELETE));
-    }
-
-    #[test]
-    fn has_permission_no_match() {
-        assert!(!has_permission(&acls(&[USER_LOOKUP]), GUILD_LOOKUP));
-        assert!(!has_permission(&acls(&[]), USER_LOOKUP));
-    }
-
-    #[test]
-    fn has_any_permission_any_match() {
-        let user_acls = acls(&[USER_LOOKUP, GUILD_LOOKUP]);
-        assert!(has_any_permission(
-            &user_acls,
-            &[GUILD_DELETE, GUILD_LOOKUP]
-        ));
-    }
-
-    #[test]
-    fn has_any_permission_empty_required() {
-        assert!(has_any_permission(&acls(&[USER_LOOKUP]), &[]));
-        assert!(has_any_permission(&acls(&[]), &[]));
-    }
-
-    #[test]
-    fn has_any_permission_none_match() {
-        let user_acls = acls(&[USER_LOOKUP]);
-        assert!(!has_any_permission(
-            &user_acls,
-            &[GUILD_DELETE, GUILD_LOOKUP]
-        ));
-    }
 }

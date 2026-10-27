@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use crate::api::generated::{snowflake, types as generated_types};
+use reqwest::Method;
+
+use crate::api::generated::types as generated_types;
 
 use super::client::{AdminApiClient, ApiError, ApiResult};
-use super::types::{BanAvatarResult, BanCheckResult, BulkBanResult};
+use super::types::{BanCheckResult, BlocklistEntryPage, BulkBanResult};
 
 impl AdminApiClient {
     pub async fn ban_email(&self, email: &str, audit_log_reason: Option<&str>) -> ApiResult<()> {
@@ -11,7 +13,7 @@ impl AdminApiClient {
             "email",
             generated_types::AdminBlocklistEntryCreateRequest::from(
                 generated_types::BanEmailRequest {
-                    email: generated_types::EmailType::from(email.to_owned()),
+                    email: generated_types::EmailBlocklistEntryType::from(email.to_owned()),
                 },
             ),
             audit_log_reason,
@@ -19,33 +21,27 @@ impl AdminApiClient {
         .await
     }
 
-    pub async fn unban_email(&self, email: &str, audit_log_reason: Option<&str>) -> ApiResult<()> {
-        self.delete_blocklist_entry("email", email, None, audit_log_reason)
-            .await
-    }
-
-    pub async fn check_email_ban(&self, email: &str) -> ApiResult<BanCheckResult> {
-        self.check_blocklist_entry("email", email, None).await
-    }
-
-    pub async fn ban_ip(&self, ip: &str, audit_log_reason: Option<&str>) -> ApiResult<()> {
+    pub async fn ban_ip(
+        &self,
+        ip: &str,
+        duration_hours: u32,
+        audit_log_reason: Option<&str>,
+    ) -> ApiResult<()> {
         self.create_blocklist_entry(
             "ip",
             generated_types::AdminBlocklistEntryCreateRequest::from(
-                generated_types::BanIpRequest { ip: ip.to_owned() },
+                generated_types::BanIpRequest {
+                    duration_hours: Some(
+                        i32::try_from(duration_hours)
+                            .map_err(|e| ApiError::Parse(e.to_string()))?
+                            .into(),
+                    ),
+                    ip: ip.to_owned(),
+                },
             ),
             audit_log_reason,
         )
         .await
-    }
-
-    pub async fn unban_ip(&self, ip: &str, audit_log_reason: Option<&str>) -> ApiResult<()> {
-        self.delete_blocklist_entry("ip", ip, None, audit_log_reason)
-            .await
-    }
-
-    pub async fn check_ip_ban(&self, ip: &str) -> ApiResult<BanCheckResult> {
-        self.check_blocklist_entry("ip", ip, None).await
     }
 
     pub async fn ban_phrase(&self, phrase: &str, audit_log_reason: Option<&str>) -> ApiResult<()> {
@@ -59,19 +55,6 @@ impl AdminApiClient {
             audit_log_reason,
         )
         .await
-    }
-
-    pub async fn unban_phrase(
-        &self,
-        phrase: &str,
-        audit_log_reason: Option<&str>,
-    ) -> ApiResult<()> {
-        self.delete_blocklist_entry("phrase", phrase, None, audit_log_reason)
-            .await
-    }
-
-    pub async fn check_phrase_ban(&self, phrase: &str) -> ApiResult<BanCheckResult> {
-        self.check_blocklist_entry("phrase", phrase, None).await
     }
 
     pub async fn ban_url(&self, url: &str, audit_log_reason: Option<&str>) -> ApiResult<()> {
@@ -89,15 +72,6 @@ impl AdminApiClient {
             audit_log_reason,
         )
         .await
-    }
-
-    pub async fn unban_url(&self, url: &str, audit_log_reason: Option<&str>) -> ApiResult<()> {
-        self.delete_blocklist_entry("url", url, None, audit_log_reason)
-            .await
-    }
-
-    pub async fn check_url_ban(&self, url: &str) -> ApiResult<BanCheckResult> {
-        self.check_blocklist_entry("url", url, None).await
     }
 
     pub async fn ban_url_domain(
@@ -123,17 +97,17 @@ impl AdminApiClient {
         .await
     }
 
-    pub async fn unban_url_domain(
+    pub async fn list_url_domain_entries(
         &self,
-        domain: &str,
-        audit_log_reason: Option<&str>,
-    ) -> ApiResult<()> {
-        self.delete_blocklist_entry("url-domain", domain, None, audit_log_reason)
+        after: Option<&str>,
+    ) -> ApiResult<BlocklistEntryPage> {
+        let list_type = blocklist_list_type("url-domain")?;
+        let response = self
+            .generated()
+            .list_admin_blocklist_entries(list_type, after, Some(BLOCKLIST_PAGE_SIZE), None)
             .await
-    }
-
-    pub async fn check_url_domain_ban(&self, domain: &str) -> ApiResult<BanCheckResult> {
-        self.check_blocklist_entry("url-domain", domain, None).await
+            .map_err(|e| self.generated_error(e))?;
+        self.generated_value(response.into_inner())
     }
 
     pub async fn ban_file_sha(
@@ -158,20 +132,6 @@ impl AdminApiClient {
         .await
     }
 
-    pub async fn unban_file_sha(
-        &self,
-        sha256_hex: &str,
-        audit_log_reason: Option<&str>,
-    ) -> ApiResult<()> {
-        self.delete_blocklist_entry("file-sha", sha256_hex, None, audit_log_reason)
-            .await
-    }
-
-    pub async fn check_file_sha_ban(&self, sha256_hex: &str) -> ApiResult<BanCheckResult> {
-        self.check_blocklist_entry("file-sha", sha256_hex, None)
-            .await
-    }
-
     pub async fn bulk_ban_file_shas(
         &self,
         sha256_list: &[String],
@@ -180,9 +140,10 @@ impl AdminApiClient {
         let body = generated_types::BulkBanFileShasRequest {
             sha256_list: sha256_list.to_vec(),
         };
-        self.put_typed_with_reason(
+        self.send(
+            Method::PUT,
             "/admin/blocklists/file-sha/entries",
-            &body,
+            Some(&body),
             audit_log_reason,
         )
         .await
@@ -210,30 +171,6 @@ impl AdminApiClient {
         .await
     }
 
-    pub async fn unban_avatar_hash(
-        &self,
-        hash_short: &str,
-        audit_log_reason: Option<&str>,
-    ) -> ApiResult<()> {
-        self.delete_blocklist_entry("avatar-hash", hash_short, None, audit_log_reason)
-            .await
-    }
-
-    pub async fn check_avatar_hash_ban(&self, hash_short: &str) -> ApiResult<BanCheckResult> {
-        self.check_blocklist_entry("avatar-hash", hash_short, None)
-            .await
-    }
-
-    pub async fn ban_user_avatar(&self, user_id: &str) -> ApiResult<BanAvatarResult> {
-        let body = generated_types::BanUserAvatarRequest::default();
-        let response = self
-            .generated()
-            .ban_admin_user_avatar(&snowflake(user_id), &body)
-            .await
-            .map_err(|e| self.generated_error(e))?;
-        self.generated_value(response.into_inner())
-    }
-
     pub async fn ban_profile_substring(
         &self,
         scope: &str,
@@ -250,30 +187,6 @@ impl AdminApiClient {
         .await
     }
 
-    pub async fn unban_profile_substring(
-        &self,
-        scope: &str,
-        substring: &str,
-        audit_log_reason: Option<&str>,
-    ) -> ApiResult<()> {
-        self.delete_blocklist_entry(
-            PROFILE_SUBSTRING_LIST,
-            substring,
-            Some(scope),
-            audit_log_reason,
-        )
-        .await
-    }
-
-    pub async fn check_profile_substring_ban(
-        &self,
-        scope: &str,
-        substring: &str,
-    ) -> ApiResult<BanCheckResult> {
-        self.check_blocklist_entry(PROFILE_SUBSTRING_LIST, substring, Some(scope))
-            .await
-    }
-
     async fn create_blocklist_entry(
         &self,
         list_type: &str,
@@ -288,7 +201,7 @@ impl AdminApiClient {
             .map_err(|error| self.generated_error(error))
     }
 
-    async fn delete_blocklist_entry(
+    pub(crate) async fn delete_blocklist_entry(
         &self,
         list_type: &str,
         entry_value: &str,
@@ -304,7 +217,7 @@ impl AdminApiClient {
             .map_err(|error| self.generated_error(error))
     }
 
-    async fn check_blocklist_entry(
+    pub(crate) async fn check_blocklist_entry(
         &self,
         list_type: &str,
         entry_value: &str,
@@ -321,7 +234,9 @@ impl AdminApiClient {
     }
 }
 
-const PROFILE_SUBSTRING_LIST: &str = "profile-substring";
+pub(crate) const PROFILE_SUBSTRING_LIST: &str = "profile-substring";
+
+const BLOCKLIST_PAGE_SIZE: &str = "200";
 
 fn blocklist_list_type(list_type: &str) -> ApiResult<generated_types::AdminBlocklistListType> {
     generated_types::AdminBlocklistListType::try_from(list_type)

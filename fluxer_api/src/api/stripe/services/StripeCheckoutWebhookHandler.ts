@@ -1,56 +1,42 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import {createUserID, type UserID} from '@app/api/BrandedTypes';
-import {Config} from '@app/api/Config';
 import type {BillingSubscriptionRow} from '@app/api/database/types/BillingTypes';
 import type {UserRow} from '@app/api/database/types/UserTypes';
-import type {IDonationRepository} from '@app/api/donation/IDonationRepository';
+import type {DonationRepository} from '@app/api/donation/DonationRepository';
 import type {IGatewayService} from '@app/api/infrastructure/IGatewayService';
 import {Logger} from '@app/api/Logger';
 import {getBillingRepository} from '@app/api/middleware/ServiceRegistry';
+import {getPaymentDisputeRepository} from '@app/api/middleware/ServiceSingletons';
 import type {Payment} from '@app/api/models/Payment';
 import type {User} from '@app/api/models/User';
+import {
+	isOperatorPassCheckoutSession,
+	type OperatorPassFulfilmentService,
+} from '@app/api/operator_pass/OperatorPassFulfilmentService';
+import {flagPurchaseDuringDispute} from '@app/api/payment_disputes/PaymentDisputeReviews';
 import type {ProductInfo, ProductRegistry} from '@app/api/stripe/ProductRegistry';
+import {ensureB2BInvoiceForCheckout} from '@app/api/stripe/StripeB2BInvoice';
+import {mirrorBestEffort} from '@app/api/stripe/StripeMirror';
 import {
 	getFirstInvoicePaymentIntentId,
-	getPrimarySubscriptionItem,
-	getSubscriptionItemPeriodEnd,
+	getSubscriptionCurrentPeriodStart,
 	getSubscriptionPremiumPeriodEnd,
 } from '@app/api/stripe/StripeSubscriptionPeriod';
-import {extractId} from '@app/api/stripe/StripeUtils';
+import {extractId, isMissingOrCancelledSubscriptionError} from '@app/api/stripe/StripeUtils';
 import {EU_WITHDRAWAL_WAIVER_TEXT_VERSION} from '@app/api/stripe/services/StripeCheckoutService';
+import {StripeDonationCheckoutFulfilment} from '@app/api/stripe/services/StripeDonationCheckoutFulfilment';
 import type {StripeGiftService} from '@app/api/stripe/services/StripeGiftService';
 import type {StripePremiumService} from '@app/api/stripe/services/StripePremiumService';
-import type {IUserRepository} from '@app/api/user/IUserRepository';
-import {mapUserToPrivateResponse} from '@app/api/user/UserMappers';
-import {isLocalizedCurrency} from '@app/api/utils/CurrencyUtils';
+import type {UserRepository} from '@app/api/user/repositories/UserRepository';
+import {dispatchUserUpdate} from '@app/api/user/UserMappers';
 import {UserPremiumTypes} from '@fluxer/constants/src/UserConstants';
+import {DAYS_PER_MONTH, MS_PER_DAY} from '@fluxer/date_utils/src/DateConstants';
 import {StripeError} from '@fluxer/errors/src/domains/payment/StripeError';
 import type {ICacheService} from '@pkgs/cache/src/ICacheService';
 import type {IEmailService} from '@pkgs/email/src/IEmailService';
 import {seconds} from 'itty-time';
 import type Stripe from 'stripe';
-
-interface DonationCustomerDetails {
-	businessName: string | undefined;
-	taxId: string | undefined;
-	taxIdType: string | undefined;
-}
-
-interface DonationSubscriptionDetails {
-	amountCents: number | null;
-	currency: string | null;
-	interval: string | null;
-	currentPeriodEnd: Date | null;
-	cancelAt: Date | null;
-	status: string | null;
-}
-
-interface CheckoutChargeDetails {
-	chargeId: string | null;
-	paymentMethodType: string | null;
-	cardCountry: string | null;
-}
 
 type CheckoutPremiumApplyResult = 'granted' | 'refunded_duplicate_subscription';
 type CheckoutSideEffectResult = 'continue' | 'stop';
@@ -76,23 +62,41 @@ interface CheckoutPremiumGrantContext extends CheckoutFulfilmentContext {
 }
 
 export class StripeCheckoutWebhookHandler {
-	static readonly CHECKOUT_EFFECTS_APPLIED_TTL_SECONDS = seconds('365 days');
+	private static readonly CHECKOUT_EFFECTS_APPLIED_TTL_SECONDS = seconds('365 days');
+	private donationFulfilment: StripeDonationCheckoutFulfilment;
 
 	constructor(
 		private stripe: Stripe | null,
-		private userRepository: IUserRepository,
-		private emailService: IEmailService,
+		private userRepository: UserRepository,
+		emailService: IEmailService,
 		private gatewayService: IGatewayService,
 		private productRegistry: ProductRegistry,
 		private cacheService: ICacheService,
 		private giftService: StripeGiftService,
 		private premiumService: StripePremiumService,
-		private donationRepository: IDonationRepository,
-	) {}
+		donationRepository: DonationRepository,
+		private operatorPassFulfilment: OperatorPassFulfilmentService | null = null,
+	) {
+		this.donationFulfilment = new StripeDonationCheckoutFulfilment(
+			stripe,
+			donationRepository,
+			emailService,
+			cacheService,
+		);
+	}
 
 	async handleCheckoutSessionCompleted(session: Stripe.Checkout.Session): Promise<void> {
+		if (this.operatorPassFulfilment && isOperatorPassCheckoutSession(session)) {
+			await this.operatorPassFulfilment.handleCheckoutSessionCompleted(session);
+			if (session.payment_status !== 'unpaid') {
+				await this.flagOpenDisputes(session);
+			}
+			await this.issueB2BInvoice(session);
+			return;
+		}
 		if (session.metadata?.is_donation === 'true') {
 			await this.handleDonationCheckoutCompleted(session);
+			await this.issueB2BInvoice(session);
 			return;
 		}
 		if (session.payment_status === 'unpaid') {
@@ -113,16 +117,33 @@ export class StripeCheckoutWebhookHandler {
 	}
 
 	async handleAsyncPaymentSucceeded(session: Stripe.Checkout.Session): Promise<void> {
+		if (this.operatorPassFulfilment && isOperatorPassCheckoutSession(session)) {
+			await this.operatorPassFulfilment.handleAsyncPaymentSucceeded(session);
+			await this.flagOpenDisputes(session);
+			await this.issueB2BInvoice({...session, payment_status: 'paid'});
+			return;
+		}
 		if (session.metadata?.is_donation === 'true') {
 			Logger.info({sessionId: session.id}, 'Processing async payment succeeded for donation checkout session');
 			await this.handleDonationCheckoutCompleted(session);
+			await this.issueB2BInvoice({...session, payment_status: 'paid'});
 			return;
 		}
 		Logger.info({sessionId: session.id}, 'Processing async payment succeeded for checkout session');
 		await this.fulfilCheckoutSession(session);
 	}
 
+	async handleCheckoutSessionExpired(session: Stripe.Checkout.Session): Promise<void> {
+		if (this.operatorPassFulfilment && isOperatorPassCheckoutSession(session)) {
+			await this.operatorPassFulfilment.handleCheckoutSessionExpired(session);
+		}
+	}
+
 	async handleAsyncPaymentFailed(session: Stripe.Checkout.Session): Promise<void> {
+		if (this.operatorPassFulfilment && isOperatorPassCheckoutSession(session)) {
+			this.operatorPassFulfilment.handleAsyncPaymentFailed(session);
+			return;
+		}
 		if (session.metadata?.is_donation === 'true') {
 			Logger.warn(
 				{
@@ -147,6 +168,19 @@ export class StripeCheckoutWebhookHandler {
 		);
 	}
 
+	private async flagOpenDisputes(session: Stripe.Checkout.Session, userId?: UserID): Promise<void> {
+		const reference = session.client_reference_id;
+		const purchaserId = userId ?? (reference && /^\d+$/.test(reference) ? createUserID(BigInt(reference)) : null);
+		if (purchaserId === null) {
+			return;
+		}
+		try {
+			await flagPurchaseDuringDispute(getPaymentDisputeRepository(), purchaserId, `stripe_checkout:${session.id}`);
+		} catch (error) {
+			Logger.error({error, sessionId: session.id}, 'Could not flag open payment dispute reviews for a checkout');
+		}
+	}
+
 	private async fulfilCheckoutSession(session: Stripe.Checkout.Session): Promise<void> {
 		let payment = await this.userRepository.getPaymentByCheckoutSession(session.id);
 		if (!payment) {
@@ -166,13 +200,6 @@ export class StripeCheckoutWebhookHandler {
 			);
 			return;
 		}
-		if (payment.status === 'completed' && payment.isGift && !payment.giftCode) {
-			Logger.warn(
-				{sessionId: session.id, userId: payment.userId},
-				'Legacy completed gift payment with no gift code — skipping (no longer recoverable via webhook)',
-			);
-			return;
-		}
 		if (payment.status === 'completed') {
 			Logger.debug({sessionId: session.id, status: payment.status}, 'Payment already processed');
 			return;
@@ -181,7 +208,7 @@ export class StripeCheckoutWebhookHandler {
 			Logger.debug({sessionId: session.id, status: payment.status}, 'Payment already processed');
 			return;
 		}
-		const productInfo = this.productRegistry.getProduct(payment.priceId!);
+		const productInfo = payment.priceId === null ? null : this.productRegistry.getProduct(payment.priceId);
 		if (!productInfo) {
 			Logger.error({sessionId: session.id, priceId: payment.priceId}, 'Unknown price ID');
 			throw new StripeError('Unknown price ID for checkout session');
@@ -191,16 +218,13 @@ export class StripeCheckoutWebhookHandler {
 			Logger.error({userId: payment.userId, sessionId: session.id}, 'User not found');
 			throw new StripeError('User not found for checkout session');
 		}
+		await this.flagOpenDisputes(session, user.id);
 		if (session.amount_total == null || !session.currency) {
 			Logger.error(
 				{sessionId: session.id, amountTotal: session.amount_total, currency: session.currency},
 				'Checkout session missing amount or currency',
 			);
 			throw new StripeError('Checkout session missing amount or currency');
-		}
-		const cardEligible = await this.validateLocalizedCardEligibility(session, payment, productInfo, user);
-		if (!cardEligible) {
-			return;
 		}
 		const customerId = extractId(session.customer);
 		const subscriptionId = extractId(session.subscription);
@@ -261,131 +285,6 @@ export class StripeCheckoutWebhookHandler {
 			},
 			'Checkout session completed and processed',
 		);
-	}
-
-	private async validateLocalizedCardEligibility(
-		session: Stripe.Checkout.Session,
-		payment: Payment,
-		productInfo: ProductInfo,
-		user: User,
-	): Promise<boolean> {
-		const requestedCountryCode = session.metadata?.country_code?.trim().toUpperCase() ?? null;
-		if (!requestedCountryCode || !this.requiresLocalizedCardEligibility(productInfo)) {
-			return true;
-		}
-		const paymentIntentId = extractId(session.payment_intent);
-		if (!paymentIntentId) {
-			const inferredPaymentMethodType = this.getDeclaredCheckoutPaymentMethodType(session);
-			if (inferredPaymentMethodType && inferredPaymentMethodType !== 'card') {
-				Logger.debug(
-					{
-						sessionId: session.id,
-						requestedCountryCode,
-						currency: productInfo.currency,
-						inferredPaymentMethodType,
-					},
-					'Skipping localized card eligibility validation because checkout explicitly used a non-card payment method',
-				);
-				return true;
-			}
-			const fallbackChargeContext = await this.getLocalizedCheckoutChargeDetailsFromSubscription(session);
-			if (fallbackChargeContext?.chargeDetails) {
-				const fallbackChargeDetails = fallbackChargeContext.chargeDetails;
-				if (fallbackChargeDetails.paymentMethodType !== 'card') {
-					Logger.debug(
-						{
-							sessionId: session.id,
-							requestedCountryCode,
-							currency: productInfo.currency,
-							fallbackPaymentMethodType: fallbackChargeDetails.paymentMethodType,
-						},
-						'Skipping localized card eligibility validation because subscription fallback resolved to a non-card payment method',
-					);
-					return true;
-				}
-				const normalizedFallbackCardCountry = fallbackChargeDetails.cardCountry?.trim().toUpperCase() ?? null;
-				if (normalizedFallbackCardCountry === requestedCountryCode) {
-					Logger.debug(
-						{
-							sessionId: session.id,
-							requestedCountryCode,
-							currency: productInfo.currency,
-							cardCountry: normalizedFallbackCardCountry,
-						},
-						'Validated localized card eligibility from subscription fallback after checkout.session.completed omitted payment_intent',
-					);
-					return true;
-				}
-				if (fallbackChargeContext.paymentIntentId && fallbackChargeDetails.chargeId) {
-					Logger.warn(
-						{
-							sessionId: session.id,
-							userId: payment.userId,
-							paymentIntentId: fallbackChargeContext.paymentIntentId,
-							chargeId: fallbackChargeDetails.chargeId,
-							requestedCountryCode,
-							cardCountry: normalizedFallbackCardCountry,
-							currency: productInfo.currency,
-						},
-						'Rejecting localized checkout because subscription fallback resolved to a card issued outside the requested country',
-					);
-					await this.rejectLocalizedCardPayment({
-						session,
-						payment,
-						user,
-						chargeDetails: fallbackChargeDetails,
-						paymentIntentId: fallbackChargeContext.paymentIntentId,
-						requestedCountryCode,
-						cardCountry: normalizedFallbackCardCountry,
-					});
-					return false;
-				}
-			}
-			Logger.error(
-				{
-					sessionId: session.id,
-					requestedCountryCode,
-					currency: productInfo.currency,
-					inferredPaymentMethodType,
-					fallbackResolved: Boolean(fallbackChargeContext?.chargeDetails),
-					fallbackPaymentIntentId: fallbackChargeContext?.paymentIntentId ?? null,
-					fallbackPaymentMethodType: fallbackChargeContext?.chargeDetails?.paymentMethodType ?? null,
-					fallbackCardCountry: fallbackChargeContext?.chargeDetails?.cardCountry ?? null,
-				},
-				'Localized checkout missing payment intent for card eligibility validation',
-			);
-			throw new StripeError('Localized checkout missing payment intent');
-		}
-		const chargeDetails = await this.getCheckoutChargeDetails(paymentIntentId);
-		if (chargeDetails.paymentMethodType !== 'card') {
-			return true;
-		}
-		const normalizedCardCountry = chargeDetails.cardCountry?.trim().toUpperCase() ?? null;
-		if (normalizedCardCountry === requestedCountryCode) {
-			return true;
-		}
-		Logger.warn(
-			{
-				sessionId: session.id,
-				userId: payment.userId,
-				paymentIntentId,
-				chargeId: chargeDetails.chargeId,
-				requestedCountryCode,
-				cardCountry: normalizedCardCountry,
-				currency: productInfo.currency,
-			},
-			'Rejecting localized checkout because card issuing country did not match requested country',
-		);
-		await this.rejectLocalizedCardPayment({
-			session,
-			payment,
-			user,
-			chargeDetails,
-			paymentIntentId,
-			requestedCountryCode,
-			cardCountry: normalizedCardCountry,
-		});
-		return false;
 	}
 
 	private async applyCheckoutSideEffects(context: CheckoutFulfilmentContext): Promise<CheckoutSideEffectResult> {
@@ -490,10 +389,7 @@ export class StripeCheckoutWebhookHandler {
 	}
 
 	private async applyCheckoutPremiumGrant(context: CheckoutPremiumGrantContext): Promise<CheckoutPremiumApplyResult> {
-		const {session, payment, user, productInfo, subscriptionId, recovery} = context;
-		if (productInfo.premiumType === UserPremiumTypes.LIFETIME && user.stripeSubscriptionId && this.stripe) {
-			await this.cancelStripeSubscriptionImmediately(user);
-		}
+		const {session, payment, productInfo, subscriptionId, recovery} = context;
 		if (this.productRegistry.isRecurringSubscription(productInfo) && subscriptionId) {
 			const duplicate = await this.detectDuplicateRecurringSubscription(payment.userId, subscriptionId, productInfo);
 			if (duplicate) {
@@ -501,25 +397,22 @@ export class StripeCheckoutWebhookHandler {
 				return 'refunded_duplicate_subscription';
 			}
 		}
-		if (productInfo.premiumType === UserPremiumTypes.LIFETIME) {
-			await this.premiumService.setPremiumLifetime(payment.userId, true);
-			return 'granted';
-		}
 		if (this.productRegistry.isRecurringSubscription(productInfo)) {
-			const periodEnd = await this.resolveCheckoutSubscriptionPeriodEnd(session, productInfo);
-			recovery.expectedPremiumUntil = periodEnd;
+			const period = await this.resolveCheckoutSubscriptionPeriod(session, productInfo);
+			recovery.expectedPremiumUntil = period.end;
 			await this.premiumService.setPremiumFromSubscriptionPeriod(
 				payment.userId,
-				productInfo.premiumType,
-				periodEnd,
+				period.end,
 				productInfo.billingCycle || null,
 				true,
+				null,
+				period.start,
 			);
 			return 'granted';
 		}
 		await this.premiumService.extendPremiumByGift(
 			payment.userId,
-			productInfo.premiumType,
+			UserPremiumTypes.SUBSCRIPTION,
 			'months',
 			productInfo.durationMonths,
 			true,
@@ -533,9 +426,21 @@ export class StripeCheckoutWebhookHandler {
 		productInfo: ProductInfo,
 	): Promise<{existingSubscriptionId: string} | null> {
 		const billingRepo = getBillingRepository();
-		const customers = await billingRepo.customers.findByUserId(userId).catch(() => []);
+		const customers = await billingRepo.customers.findByUserId(userId).catch((error) => {
+			Logger.warn(
+				{error, userId, newSubscriptionId},
+				'Failed to load billing customers for duplicate checkout detection',
+			);
+			return [];
+		});
 		for (const customer of customers) {
-			const subs = await billingRepo.subscriptions.listByCustomer(customer.provider_id).catch(() => []);
+			const subs = await billingRepo.subscriptions.listByCustomer(customer.provider_id).catch((error) => {
+				Logger.warn(
+					{error, userId, customerId: customer.provider_id, newSubscriptionId},
+					'Failed to load billing subscriptions for duplicate checkout detection',
+				);
+				return [];
+			});
 			const duplicate = subs.find((sub) =>
 				this.isDuplicateRecurringSubscriptionCandidate(sub, newSubscriptionId, productInfo),
 			);
@@ -565,9 +470,13 @@ export class StripeCheckoutWebhookHandler {
 	}
 
 	private isSameProductRecurring(existingPriceId: string | null, productInfo: ProductInfo): boolean {
-		if (!existingPriceId) return false;
+		if (!existingPriceId) {
+			return false;
+		}
 		const existingProduct = this.productRegistry.getProduct(existingPriceId);
-		if (!existingProduct) return false;
+		if (!existingProduct) {
+			return false;
+		}
 		return existingProduct.type === productInfo.type;
 	}
 
@@ -601,7 +510,7 @@ export class StripeCheckoutWebhookHandler {
 				{stripe_subscription_id: existingSubscriptionId},
 				latestUser.toRow(),
 			);
-			await this.dispatchUser(restoredUser);
+			await dispatchUserUpdate(this.gatewayService, restoredUser);
 		}
 		await this.userRepository.updatePayment({
 			...payment.toRow(),
@@ -617,7 +526,9 @@ export class StripeCheckoutWebhookHandler {
 	}
 
 	private async tryGetLatestChargeForSubscription(subscriptionId: string): Promise<string | null> {
-		if (!this.stripe) return null;
+		if (!this.stripe) {
+			return null;
+		}
 		try {
 			const subscription = await this.stripe.subscriptions.retrieve(subscriptionId, {
 				expand: ['latest_invoice.payments.data.payment'],
@@ -637,7 +548,9 @@ export class StripeCheckoutWebhookHandler {
 	}
 
 	private async refundChargeForDuplicateSubscription(chargeId: string, checkoutSessionId: string): Promise<void> {
-		if (!this.stripe) return;
+		if (!this.stripe) {
+			return;
+		}
 		const refund = await this.stripe.refunds.create(
 			{
 				charge: chargeId,
@@ -648,27 +561,24 @@ export class StripeCheckoutWebhookHandler {
 			},
 			{idempotencyKey: `duplicate-sub-refund:${checkoutSessionId}`},
 		);
-		try {
-			await getBillingRepository().refunds.upsertFromStripe(refund);
-		} catch (mirrorErr) {
-			Logger.error(
-				{mirrorErr, refundId: refund.id},
-				'Mirror upsert failed for duplicate-sub refund; reconciler will heal',
-			);
-		}
+		await mirrorBestEffort(
+			() => getBillingRepository().refunds.upsertFromStripe(refund),
+			{refundId: refund.id},
+			'Mirror upsert failed for duplicate-sub refund; reconciler will heal',
+		);
 	}
 
-	private async resolveCheckoutSubscriptionPeriodEnd(
+	private async resolveCheckoutSubscriptionPeriod(
 		session: Stripe.Checkout.Session,
 		productInfo: ProductInfo,
-	): Promise<Date> {
+	): Promise<{start: Date | null; end: Date}> {
 		const subscriptionId = extractId(session.subscription);
 		if (subscriptionId && this.stripe) {
 			try {
 				const subscription = await this.stripe.subscriptions.retrieve(subscriptionId);
 				const candidate = getSubscriptionPremiumPeriodEnd(subscription);
 				if (candidate) {
-					return candidate;
+					return {start: getSubscriptionCurrentPeriodStart(subscription), end: candidate};
 				}
 			} catch (error) {
 				Logger.warn(
@@ -677,12 +587,12 @@ export class StripeCheckoutWebhookHandler {
 				);
 			}
 		}
-		const fallback = new Date(Date.now() + productInfo.durationMonths * 30 * 24 * 60 * 60 * 1000);
+		const fallback = new Date(Date.now() + productInfo.durationMonths * DAYS_PER_MONTH * MS_PER_DAY);
 		Logger.warn(
 			{sessionId: session.id, subscriptionId, durationMonths: productInfo.durationMonths},
 			'Using product duration fallback for subscription period_end on checkout fulfilment',
 		);
-		return fallback;
+		return {start: null, end: fallback};
 	}
 
 	private didCheckoutPremiumGrantApply(
@@ -694,10 +604,7 @@ export class StripeCheckoutWebhookHandler {
 		if (!latestUser) {
 			return false;
 		}
-		if (productInfo.premiumType === UserPremiumTypes.LIFETIME) {
-			return latestUser.premiumType === UserPremiumTypes.LIFETIME && latestUser.premiumUntil === null;
-		}
-		if (latestUser.premiumType !== productInfo.premiumType) {
+		if (latestUser.premiumType !== UserPremiumTypes.SUBSCRIPTION) {
 			return false;
 		}
 		if (this.productRegistry.isRecurringSubscription(productInfo)) {
@@ -719,183 +626,12 @@ export class StripeCheckoutWebhookHandler {
 		return latestServerSeq > initialServerSeq;
 	}
 
-	private requiresLocalizedCardEligibility(productInfo: ProductInfo): boolean {
-		return isLocalizedCurrency(productInfo.currency);
-	}
-
-	private getDeclaredCheckoutPaymentMethodType(session: Stripe.Checkout.Session): string | null {
-		const metadataPaymentMethod = session.metadata?.payment_method?.trim().toLowerCase() ?? null;
-		if (metadataPaymentMethod) {
-			return metadataPaymentMethod;
-		}
-		const paymentMethodTypes = session.payment_method_types ?? [];
-		if (paymentMethodTypes.length === 1) {
-			return paymentMethodTypes[0]?.trim().toLowerCase() ?? null;
-		}
-		if (paymentMethodTypes.length > 1 && !paymentMethodTypes.some((type) => type.toLowerCase() === 'card')) {
-			return paymentMethodTypes[0]?.trim().toLowerCase() ?? null;
-		}
-		return null;
-	}
-
-	private async getLocalizedCheckoutChargeDetailsFromSubscription(session: Stripe.Checkout.Session): Promise<{
-		paymentIntentId: string | null;
-		chargeDetails: CheckoutChargeDetails | null;
-	} | null> {
-		if (!this.stripe) {
-			return null;
-		}
-		const subscriptionId = extractId(session.subscription);
-		if (!subscriptionId) {
-			return null;
-		}
-		type StripeSubscriptionWithFallbackPaymentState = Stripe.Subscription & {
-			default_payment_method?:
-				| {
-						id?: string;
-						type?: string | null;
-						card?: {
-							country?: string | null;
-						} | null;
-				  }
-				| string
-				| null;
-			latest_invoice?: Stripe.Invoice | string | null;
-		};
+	private async issueB2BInvoice(session: Stripe.Checkout.Session): Promise<void> {
 		try {
-			const subscription = (await this.stripe.subscriptions.retrieve(subscriptionId, {
-				expand: ['default_payment_method', 'latest_invoice.payments.data.payment'],
-			})) as StripeSubscriptionWithFallbackPaymentState;
-			const latestInvoice =
-				typeof subscription.latest_invoice === 'string' ? null : (subscription.latest_invoice ?? null);
-			const invoicePaymentIntentId = getFirstInvoicePaymentIntentId(latestInvoice);
-			if (invoicePaymentIntentId) {
-				return {
-					paymentIntentId: invoicePaymentIntentId,
-					chargeDetails: await this.getCheckoutChargeDetails(invoicePaymentIntentId),
-				};
-			}
-			const defaultPaymentMethod =
-				typeof subscription.default_payment_method === 'string' ? null : subscription.default_payment_method;
-			if (!defaultPaymentMethod) {
-				return null;
-			}
-			return {
-				paymentIntentId: null,
-				chargeDetails: {
-					chargeId: null,
-					paymentMethodType: defaultPaymentMethod.type ?? null,
-					cardCountry: defaultPaymentMethod.card?.country ?? null,
-				},
-			};
+			await ensureB2BInvoiceForCheckout(this.stripe, session);
 		} catch (error) {
-			Logger.warn(
-				{
-					error,
-					sessionId: session.id,
-					subscriptionId,
-				},
-				'Failed to load subscription fallback payment details for localized card eligibility',
-			);
-			return null;
+			Logger.error({error, sessionId: session.id}, 'Failed to create the business invoice for a paid checkout');
 		}
-	}
-
-	private async getCheckoutChargeDetails(paymentIntentId: string): Promise<CheckoutChargeDetails> {
-		if (!this.stripe) {
-			throw new StripeError('Stripe client not available for localized card eligibility checks');
-		}
-		try {
-			const paymentIntent = await this.stripe.paymentIntents.retrieve(paymentIntentId, {
-				expand: ['latest_charge'],
-			});
-			const latestCharge = paymentIntent.latest_charge;
-			if (!latestCharge) {
-				throw new StripeError('Payment intent missing latest charge');
-			}
-			const charge = typeof latestCharge === 'string' ? await this.stripe.charges.retrieve(latestCharge) : latestCharge;
-			const paymentMethodDetails = charge.payment_method_details;
-			return {
-				chargeId: charge.id,
-				paymentMethodType: this.getChargePaymentMethodType(paymentMethodDetails),
-				cardCountry: paymentMethodDetails?.card?.country ?? null,
-			};
-		} catch (error) {
-			Logger.error({error, paymentIntentId}, 'Failed to load Stripe charge details for localized card eligibility');
-			throw error;
-		}
-	}
-
-	private getChargePaymentMethodType(paymentMethodDetails: Stripe.Charge.PaymentMethodDetails | null): string | null {
-		if (!paymentMethodDetails) {
-			return null;
-		}
-		if (paymentMethodDetails.type) {
-			return paymentMethodDetails.type;
-		}
-		if (paymentMethodDetails.card) {
-			return 'card';
-		}
-		if ('pix' in paymentMethodDetails && paymentMethodDetails.pix) {
-			return 'pix';
-		}
-		if ('upi' in paymentMethodDetails && paymentMethodDetails.upi) {
-			return 'upi';
-		}
-		return null;
-	}
-
-	private async rejectLocalizedCardPayment({
-		session,
-		payment,
-		user,
-		chargeDetails,
-		paymentIntentId,
-		requestedCountryCode,
-		cardCountry,
-	}: {
-		session: Stripe.Checkout.Session;
-		payment: Payment;
-		user: User;
-		chargeDetails: CheckoutChargeDetails;
-		paymentIntentId: string;
-		requestedCountryCode: string;
-		cardCountry: string | null;
-	}): Promise<void> {
-		const subscriptionId = extractId(session.subscription);
-		if (subscriptionId) {
-			await this.cancelStripeSubscriptionById(subscriptionId, session.id, user.id.toString());
-		}
-		if (chargeDetails.chargeId) {
-			await this.refundChargeForLocalizedCardMismatch({
-				chargeId: chargeDetails.chargeId,
-				checkoutSessionId: session.id,
-				requestedCountryCode,
-				cardCountry,
-			});
-		} else {
-			Logger.warn(
-				{
-					sessionId: session.id,
-					userId: user.id.toString(),
-					paymentIntentId,
-					requestedCountryCode,
-					cardCountry,
-				},
-				'Skipping localized card refund because Stripe did not surface a charge id',
-			);
-		}
-		await this.userRepository.updatePayment({
-			...payment.toRow(),
-			stripe_customer_id: extractId(session.customer),
-			payment_intent_id: paymentIntentId,
-			subscription_id: subscriptionId,
-			invoice_id: typeof session.invoice === 'string' ? session.invoice : null,
-			amount_cents: session.amount_total ?? payment.amountCents,
-			currency: session.currency ?? payment.currency,
-			status: 'failed',
-			completed_at: payment.completedAt ?? new Date(),
-		});
 	}
 
 	private async handleDonationCheckoutCompleted(session: Stripe.Checkout.Session): Promise<void> {
@@ -904,195 +640,11 @@ export class StripeCheckoutWebhookHandler {
 			Logger.error({sessionId: session.id}, 'Donation checkout missing email in metadata');
 			throw new StripeError('Donation checkout missing email');
 		}
-		const customerId = extractId(session.customer);
-		if (!customerId) {
-			Logger.error({sessionId: session.id}, 'Donation checkout missing customer');
-			throw new StripeError('Donation checkout missing customer id');
-		}
-		const donationLocale = session.metadata?.donation_locale ?? null;
-		const isRecurring = session.mode === 'subscription';
-		const subscriptionId = extractId(session.subscription);
-		if (isRecurring && !subscriptionId) {
-			Logger.error({sessionId: session.id}, 'Donation checkout missing subscription id');
-			throw new StripeError('Donation checkout missing subscription id');
-		}
-		const customerDetails = await this.loadDonationCustomerDetails(
-			customerId,
-			session.metadata?.is_business === 'true',
-		);
-		const subscriptionDetails = isRecurring
-			? await this.loadDonationSubscriptionDetails(subscriptionId)
-			: {amountCents: null, currency: null, interval: null, currentPeriodEnd: null, cancelAt: null, status: null};
-		const existingDonor = await this.donationRepository.findDonorByEmail(email);
-		const subscriptionUpdate = {
-			stripeSubscriptionId: subscriptionId,
-			subscriptionAmountCents: subscriptionDetails.amountCents,
-			subscriptionCurrency: subscriptionDetails.currency,
-			subscriptionInterval: subscriptionDetails.interval,
-			subscriptionCurrentPeriodEnd: subscriptionDetails.currentPeriodEnd,
-			subscriptionCancelAt: subscriptionDetails.cancelAt,
-			subscriptionStatus: subscriptionDetails.status,
-		};
-		if (existingDonor && isRecurring) {
-			await this.donationRepository.updateDonorSubscription(email, {
-				stripeCustomerId: customerId,
-				businessName: customerDetails.businessName,
-				taxId: customerDetails.taxId,
-				taxIdType: customerDetails.taxIdType,
-				...subscriptionUpdate,
-			});
-		} else if (existingDonor) {
-			const subscriptionCustomerId = existingDonor.stripeSubscriptionId ? existingDonor.stripeCustomerId : null;
-			await this.donationRepository.updateDonorCustomerDetails(email, {
-				stripeCustomerId: subscriptionCustomerId ?? customerId,
-				businessName: customerDetails.businessName,
-				taxId: customerDetails.taxId,
-				taxIdType: customerDetails.taxIdType,
-			});
-			await this.donationRepository.linkDonorStripeCustomer(email, customerId);
-		} else {
-			await this.donationRepository.createDonor({
-				email,
-				stripeCustomerId: customerId,
-				businessName: customerDetails.businessName,
-				taxId: customerDetails.taxId,
-				taxIdType: customerDetails.taxIdType,
-				...subscriptionUpdate,
-			});
-		}
-		if (session.payment_status === 'unpaid') {
-			Logger.info(
-				{sessionId: session.id, email, isRecurring, paymentStatus: session.payment_status},
-				'Donation checkout completed with unpaid status; deferring confirmation until settlement',
-			);
-			return;
-		}
-		const encodedEmail = encodeURIComponent(email);
-		const manageUrl = `${Config.endpoints.marketing}/donate/manage?email=${encodedEmail}`;
-		if (isRecurring) {
-			const recurringAmountCents = subscriptionDetails.amountCents;
-			const recurringCurrency = subscriptionDetails.currency;
-			const recurringInterval = subscriptionDetails.interval;
-			if (recurringAmountCents == null || !recurringCurrency || !recurringInterval) {
-				Logger.error({sessionId: session.id, subscriptionId}, 'Donation subscription details incomplete');
-				throw new StripeError('Donation subscription details incomplete');
-			}
-			await this.sendDonationConfirmationOnce({
-				sessionId: session.id,
-				email,
-				amountCents: recurringAmountCents,
-				currency: recurringCurrency,
-				interval: recurringInterval,
-				manageUrl,
-				locale: donationLocale,
-			});
-		} else {
-			const oneTimeAmountCents = session.amount_total;
-			const oneTimeCurrency = session.currency;
-			if (oneTimeAmountCents == null || !oneTimeCurrency) {
-				Logger.error(
-					{sessionId: session.id, amountTotal: session.amount_total, currency: session.currency},
-					'Donation checkout missing amount or currency',
-				);
-				throw new StripeError('Donation checkout missing amount or currency');
-			}
-			await this.sendDonationConfirmationOnce({
-				sessionId: session.id,
-				email,
-				amountCents: oneTimeAmountCents,
-				currency: oneTimeCurrency,
-				interval: 'once',
-				manageUrl,
-				locale: donationLocale,
-			});
-		}
-		Logger.info(
-			{
-				email,
-				customerId,
-				subscriptionId,
-				businessName: customerDetails.businessName,
-				taxId: customerDetails.taxId,
-				taxIdType: customerDetails.taxIdType,
-				isRecurring,
-				amountCents: isRecurring ? subscriptionDetails.amountCents : session.amount_total,
-				currency: isRecurring ? subscriptionDetails.currency : session.currency,
-				interval: subscriptionDetails.interval,
-			},
-			'Donation checkout completed',
-		);
-	}
-
-	private async sendDonationConfirmationOnce({
-		sessionId,
-		email,
-		amountCents,
-		currency,
-		interval,
-		manageUrl,
-		locale,
-	}: {
-		sessionId: string;
-		email: string;
-		amountCents: number;
-		currency: string;
-		interval: string;
-		manageUrl: string;
-		locale: string | null;
-	}): Promise<void> {
-		const confirmationSentKey = this.getDonationConfirmationSentKey(sessionId);
-		if (await this.cacheService.get<boolean>(confirmationSentKey)) {
-			Logger.debug({sessionId}, 'Donation confirmation already sent for checkout session');
-			return;
-		}
-		const sent = await this.emailService.sendDonationConfirmation(
+		await this.donationFulfilment.registerDonation(session, {
 			email,
-			amountCents,
-			currency,
-			interval,
-			manageUrl,
-			locale,
-		);
-		if (!sent) {
-			Logger.error({sessionId, email, interval}, 'Failed to send donation confirmation email');
-			throw new StripeError('Failed to send donation confirmation email');
-		}
-		await this.cacheService.set(
-			confirmationSentKey,
-			true,
-			StripeCheckoutWebhookHandler.CHECKOUT_EFFECTS_APPLIED_TTL_SECONDS,
-		);
-	}
-
-	private async cancelStripeSubscriptionImmediately(user: User): Promise<void> {
-		if (!this.stripe) {
-			throw new StripeError('Stripe client not available for immediate cancellation');
-		}
-		if (!user.stripeSubscriptionId) {
-			throw new StripeError('User missing subscription id for immediate cancellation');
-		}
-		const canceledSubscription = await this.stripe.subscriptions.cancel(user.stripeSubscriptionId, {
-			invoice_now: false,
-			prorate: false,
+			locale: session.metadata?.donation_locale ?? null,
+			isBusiness: session.metadata?.is_business === 'true',
 		});
-		try {
-			await getBillingRepository().subscriptions.upsertFromStripe(canceledSubscription, {
-				knownUserId: user.id,
-				snapshotCapturedAt: new Date(),
-			});
-		} catch (mirrorErr) {
-			Logger.error(
-				{mirrorErr, subId: canceledSubscription.id},
-				'Mirror upsert failed after Stripe write; reconciler will heal',
-			);
-		}
-		const updatedUser = await this.userRepository.patchUpsert(user.id, {
-			stripe_subscription_id: null,
-			premium_billing_cycle: null,
-			premium_will_cancel: false,
-		});
-		await this.dispatchUser(updatedUser);
-		Logger.debug({userId: user.id}, 'Canceled active subscription due to lifetime grant');
 	}
 
 	private async cancelStripeSubscriptionById(
@@ -1109,18 +661,16 @@ export class StripeCheckoutWebhookHandler {
 				{invoice_now: false, prorate: false},
 				{idempotencyKey: `localized-card-country-cancel:${checkoutSessionId}`},
 			);
-			try {
-				await getBillingRepository().subscriptions.upsertFromStripe(canceledSubscription, {
-					snapshotCapturedAt: new Date(),
-				});
-			} catch (mirrorErr) {
-				Logger.error(
-					{mirrorErr, subId: canceledSubscription.id},
-					'Mirror upsert failed after Stripe write; reconciler will heal',
-				);
-			}
+			await mirrorBestEffort(
+				() =>
+					getBillingRepository().subscriptions.upsertFromStripe(canceledSubscription, {
+						snapshotCapturedAt: new Date(),
+					}),
+				{subId: canceledSubscription.id},
+				'Mirror upsert failed after Stripe write; reconciler will heal',
+			);
 		} catch (error) {
-			if (this.isMissingOrCancelledSubscriptionError(error)) {
+			if (isMissingOrCancelledSubscriptionError(error)) {
 				Logger.warn(
 					{subscriptionId, checkoutSessionId, userId},
 					'Stripe subscription was already unavailable while rejecting localized card payment',
@@ -1133,61 +683,6 @@ export class StripeCheckoutWebhookHandler {
 			);
 			throw error;
 		}
-	}
-
-	private async refundChargeForLocalizedCardMismatch({
-		chargeId,
-		checkoutSessionId,
-		requestedCountryCode,
-		cardCountry,
-	}: {
-		chargeId: string;
-		checkoutSessionId: string;
-		requestedCountryCode: string;
-		cardCountry: string | null;
-	}): Promise<void> {
-		if (!this.stripe) {
-			throw new StripeError('Stripe client not available for localized card refund');
-		}
-		const refund = await this.stripe.refunds.create(
-			{
-				charge: chargeId,
-				metadata: {
-					checkout_session_id: checkoutSessionId,
-					rejection_reason: 'localized_card_country_mismatch',
-					expected_country: requestedCountryCode,
-					actual_country: cardCountry ?? 'unknown',
-				},
-			},
-			{idempotencyKey: `localized-card-country-refund:${checkoutSessionId}`},
-		);
-		try {
-			await getBillingRepository().refunds.upsertFromStripe(refund);
-		} catch (mirrorErr) {
-			Logger.error({mirrorErr, refundId: refund.id}, 'Mirror upsert failed after Stripe write; reconciler will heal');
-		}
-	}
-
-	private isMissingOrCancelledSubscriptionError(error: unknown): boolean {
-		if (!(error instanceof Error)) {
-			return false;
-		}
-		const normalizedMessage = error.message.toLowerCase();
-		return (
-			normalizedMessage.includes('no such subscription') ||
-			normalizedMessage.includes('cannot cancel a canceled subscription') ||
-			normalizedMessage.includes('cannot cancel a cancelled subscription') ||
-			normalizedMessage.includes('subscription is canceled') ||
-			normalizedMessage.includes('subscription is cancelled')
-		);
-	}
-
-	private async dispatchUser(user: User): Promise<void> {
-		await this.gatewayService.dispatchPresence({
-			userId: user.id,
-			event: 'USER_UPDATE',
-			data: mapUserToPrivateResponse(user),
-		});
 	}
 
 	private async tryRecoverPaymentFromSessionMetadata(session: Stripe.Checkout.Session): Promise<Payment | null> {
@@ -1212,7 +707,7 @@ export class StripeCheckoutWebhookHandler {
 			return null;
 		}
 		try {
-			await this.userRepository.createPayment({
+			const payment = {
 				checkout_session_id: session.id,
 				user_id: userId,
 				price_id: priceId,
@@ -1224,11 +719,14 @@ export class StripeCheckoutWebhookHandler {
 				purchase_client_country_code: session.metadata?.purchase_client_country_code ?? null,
 				eu_withdrawal_waiver_required: euWithdrawalWaiverRequired,
 				eu_withdrawal_waiver_accepted: euWithdrawalWaiverAccepted,
-				eu_withdrawal_waiver_accepted_at: Number.isNaN(euWithdrawalWaiverAcceptedAt?.getTime() ?? Number.NaN)
-					? session.consent?.terms_of_service === 'accepted'
-						? new Date()
-						: null
-					: euWithdrawalWaiverAcceptedAt,
+			};
+			let waiverAcceptedAt = euWithdrawalWaiverAcceptedAt;
+			if (Number.isNaN(waiverAcceptedAt?.getTime() ?? Number.NaN)) {
+				waiverAcceptedAt = session.consent?.terms_of_service === 'accepted' ? new Date() : null;
+			}
+			await this.userRepository.createPayment({
+				...payment,
+				eu_withdrawal_waiver_accepted_at: waiverAcceptedAt,
 				eu_withdrawal_waiver_text_version:
 					session.metadata?.eu_withdrawal_waiver_text_version ?? EU_WITHDRAWAL_WAIVER_TEXT_VERSION,
 			});
@@ -1256,69 +754,5 @@ export class StripeCheckoutWebhookHandler {
 
 	private getCheckoutGiftFinalisedKey(checkoutSessionId: string): string {
 		return `stripe:checkout:gift:finalised:${checkoutSessionId}`;
-	}
-
-	private getDonationConfirmationSentKey(checkoutSessionId: string): string {
-		return `stripe:checkout:donation:confirmation:sent:${checkoutSessionId}`;
-	}
-
-	private async loadDonationCustomerDetails(customerId: string, isBusiness: boolean): Promise<DonationCustomerDetails> {
-		if (!this.stripe) {
-			throw new StripeError('Stripe client not available for donation customer lookup');
-		}
-		try {
-			const customer = await this.stripe.customers.retrieve(customerId, {expand: ['tax_ids']});
-			if (customer && !customer.deleted) {
-				const primaryTaxId = customer.tax_ids?.data?.[0] ?? null;
-				const isBusinessDonor = isBusiness || primaryTaxId !== null;
-				return {
-					businessName: isBusinessDonor ? (customer.name ?? undefined) : undefined,
-					taxId: primaryTaxId?.value ?? undefined,
-					taxIdType: primaryTaxId?.type ?? undefined,
-				};
-			}
-		} catch (error) {
-			Logger.error({error, customerId}, 'Failed to retrieve customer details');
-			throw error;
-		}
-		throw new StripeError('Donation customer not found');
-	}
-
-	private async loadDonationSubscriptionDetails(subscriptionId: string | null): Promise<DonationSubscriptionDetails> {
-		if (!subscriptionId) {
-			throw new StripeError('Donation subscription id missing for lookup');
-		}
-		if (!this.stripe) {
-			throw new StripeError('Stripe client not available for donation subscription lookup');
-		}
-		try {
-			const subscription = await this.stripe.subscriptions.retrieve(subscriptionId);
-			const item = getPrimarySubscriptionItem(subscription);
-			if (!item) {
-				Logger.error({subscriptionId}, 'Subscription has no items for donation checkout');
-				throw new StripeError('Donation subscription has no items');
-			}
-			if (!item.price?.recurring || item.price.unit_amount == null || !item.price.currency) {
-				Logger.error({subscriptionId}, 'Donation subscription missing pricing details');
-				throw new StripeError('Donation subscription missing pricing details');
-			}
-			const currentPeriodEnd = getSubscriptionItemPeriodEnd(item);
-			if (!currentPeriodEnd) {
-				Logger.error({subscriptionId}, 'Donation subscription missing period end');
-				throw new StripeError('Donation subscription missing period end');
-			}
-			const cancelAt = subscription.cancel_at ? new Date(subscription.cancel_at * 1000) : null;
-			return {
-				amountCents: item.price.unit_amount,
-				currency: item.price.currency,
-				interval: item.price.recurring.interval,
-				currentPeriodEnd,
-				cancelAt,
-				status: subscription.status,
-			};
-		} catch (error) {
-			Logger.error({error, subscriptionId}, 'Failed to retrieve subscription details');
-			throw error;
-		}
 	}
 }

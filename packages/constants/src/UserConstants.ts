@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import {
+	PREMIUM_PROFILE_BADGE_KINDS,
+	type ProfileBadgeKey,
+	type ProfileBadgeKind,
+} from '@fluxer/constants/src/BadgeConstants';
 import type {ValueOf} from '@fluxer/constants/src/ValueOf';
 
 export const UNCATEGORIZED_FOLDER_ID = -1;
@@ -57,20 +62,19 @@ export const UserFlags = {
 	FRIENDLY_BOT: 1n << 4n,
 	FRIENDLY_BOT_MANUAL_APPROVAL: 1n << 5n,
 	SPAMMER: 1n << 6n,
+	PROFILE_HIDDEN: 1n << 7n,
 	DELETED: 1n << 34n,
-	DISABLED_SUSPICIOUS_ACTIVITY: 1n << 35n,
 	SELF_DELETED: 1n << 36n,
 	DISABLED: 1n << 38n,
 	HAS_SESSION_STARTED: 1n << 39n,
 	RATE_LIMIT_BYPASS: 1n << 47n,
 	REPORT_BANNED: 1n << 48n,
 	VERIFIED_NOT_UNDERAGE: 1n << 49n,
+	ACCOUNT_LIMITED: 1n << 50n,
 	HAS_DISMISSED_PREMIUM_ONBOARDING: 1n << 51n,
 	APP_STORE_REVIEWER: 1n << 53n,
-	STAFF_HIDDEN: 1n << 57n,
 	AGE_VERIFIED_ADULT: 1n << 60n,
-	FORCE_INBOUND_PHONE_VERIFICATION: 1n << 61n,
-	NOT_SUSPICIOUS: 1n << 62n,
+	LIMIT_EXEMPT: 1n << 62n,
 } as const;
 export const UserFlagsDescriptions: Record<keyof typeof UserFlags, string> = {
 	STAFF: 'User is a staff member',
@@ -80,49 +84,52 @@ export const UserFlagsDescriptions: Record<keyof typeof UserFlags, string> = {
 	FRIENDLY_BOT: 'Bot accepts friend requests from users',
 	FRIENDLY_BOT_MANUAL_APPROVAL: 'Bot requires manual approval for friend requests',
 	SPAMMER: 'User is flagged as a spammer',
+	PROFILE_HIDDEN: 'User profile details are hidden from other users',
 	DELETED: 'User account has been deleted',
-	DISABLED_SUSPICIOUS_ACTIVITY: 'User account disabled due to suspicious activity',
 	SELF_DELETED: 'User account was self-deleted',
 	DISABLED: 'User account is disabled',
 	HAS_SESSION_STARTED: 'User has started a session',
 	RATE_LIMIT_BYPASS: 'User can bypass rate limits',
 	REPORT_BANNED: 'User is banned from reporting',
 	VERIFIED_NOT_UNDERAGE: 'User is verified as not underage',
+	ACCOUNT_LIMITED: 'User account is limited',
 	HAS_DISMISSED_PREMIUM_ONBOARDING: 'User has dismissed premium onboarding',
 	APP_STORE_REVIEWER: 'User is an app store reviewer',
-	STAFF_HIDDEN: 'User staff status is hidden from public flags',
-	AGE_VERIFIED_ADULT: 'User has verified their age as an adult via credit card verification',
-	FORCE_INBOUND_PHONE_VERIFICATION: 'User is forced through inbound phone verification, for debugging',
-	NOT_SUSPICIOUS: 'User is permanently exempt from automatic suspicious-activity flagging',
+	AGE_VERIFIED_ADULT: 'User has verified their age as an adult',
+	LIMIT_EXEMPT: 'User is permanently exempt from account limitation',
 };
 export const PremiumFlags = {
 	DISCRIMINATOR: 1 << 0,
-	BADGE_HIDDEN: 1 << 1,
 	BADGE_MASKED: 1 << 2,
 	BADGE_TIMESTAMP_HIDDEN: 1 << 3,
-	BADGE_SEQUENCE_HIDDEN: 1 << 4,
 	PERKS_SANITIZED: 1 << 5,
 	PURCHASE_DISABLED: 1 << 6,
 	ENABLED_OVERRIDE: 1 << 7,
 	PERKS_DISABLED: 1 << 8,
+	OPERATOR_PASS_BADGE_TIMESTAMP_HIDDEN: 1 << 11,
+	OPERATOR_PASS_BADGE_COUNT_HIDDEN: 1 << 12,
 } as const;
 export const PremiumFlagsDescriptions: Record<keyof typeof PremiumFlags, string> = {
 	DISCRIMINATOR: 'User has a premium discriminator',
-	BADGE_HIDDEN: 'User has hidden their premium badge',
 	BADGE_MASKED: 'User has masked their premium badge',
 	BADGE_TIMESTAMP_HIDDEN: 'User has hidden their premium badge timestamp',
-	BADGE_SEQUENCE_HIDDEN: 'User has hidden their premium badge sequence',
 	PERKS_SANITIZED: 'User premium perks are sanitized',
 	PURCHASE_DISABLED: 'Premium purchase is disabled for this user',
 	ENABLED_OVERRIDE: 'Premium status is enabled via override',
 	PERKS_DISABLED: 'User has temporarily disabled premium perks',
+	OPERATOR_PASS_BADGE_TIMESTAMP_HIDDEN: 'User has hidden when they first got the Operator Pass',
+	OPERATOR_PASS_BADGE_COUNT_HIDDEN: 'User has hidden how many Operator Passes they hold',
 };
+const LEGACY_PREMIUM_BADGE_HIDDEN = 1 << 1;
+const LEGACY_PREMIUM_BADGE_SEQUENCE_HIDDEN = 1 << 4;
+const LEGACY_OPERATOR_PASS_BADGE_HIDDEN = 1 << 9;
+const LEGACY_STAFF_HIDDEN = 1n << 57n;
 const LEGACY_PREMIUM_FLAG_BITS_TO_NEW: ReadonlyArray<readonly [bigint, number]> = [
 	[1n << 37n, PremiumFlags.DISCRIMINATOR],
-	[1n << 40n, PremiumFlags.BADGE_HIDDEN],
+	[1n << 40n, LEGACY_PREMIUM_BADGE_HIDDEN],
 	[1n << 41n, PremiumFlags.BADGE_MASKED],
 	[1n << 42n, PremiumFlags.BADGE_TIMESTAMP_HIDDEN],
-	[1n << 43n, PremiumFlags.BADGE_SEQUENCE_HIDDEN],
+	[1n << 43n, LEGACY_PREMIUM_BADGE_SEQUENCE_HIDDEN],
 	[1n << 44n, PremiumFlags.PERKS_SANITIZED],
 	[1n << 45n, PremiumFlags.PURCHASE_DISABLED],
 	[1n << 46n, PremiumFlags.ENABLED_OVERRIDE],
@@ -131,7 +138,8 @@ export const LEGACY_PREMIUM_FLAGS_MASK: bigint = LEGACY_PREMIUM_FLAG_BITS_TO_NEW
 	(mask, [legacy]) => mask | legacy,
 	0n,
 );
-export const LEGACY_DEAD_USER_FLAGS_MASK: bigint = (1n << 52n) | (1n << 54n) | (1n << 55n) | (1n << 56n) | (1n << 58n);
+export const LEGACY_DEAD_USER_FLAGS_MASK: bigint =
+	(1n << 35n) | (1n << 52n) | (1n << 54n) | (1n << 55n) | (1n << 56n) | (1n << 58n) | (1n << 61n);
 
 export function extractPremiumFlagsFromLegacyUserFlags(legacyFlags: bigint): number {
 	let result = 0;
@@ -143,6 +151,34 @@ export function extractPremiumFlagsFromLegacyUserFlags(legacyFlags: bigint): num
 	return result;
 }
 
+const LEGACY_PREMIUM_BADGE_HIDE_BITS: ReadonlyArray<readonly [number, ReadonlyArray<ProfileBadgeKind>]> = [
+	[LEGACY_PREMIUM_BADGE_HIDDEN, PREMIUM_PROFILE_BADGE_KINDS],
+	[LEGACY_PREMIUM_BADGE_SEQUENCE_HIDDEN, ['visionary_number']],
+	[LEGACY_OPERATOR_PASS_BADGE_HIDDEN, ['operator_pass']],
+];
+export const LEGACY_BADGE_HIDE_PREMIUM_FLAGS_MASK: number =
+	LEGACY_PREMIUM_BADGE_HIDDEN | LEGACY_PREMIUM_BADGE_SEQUENCE_HIDDEN | LEGACY_OPERATOR_PASS_BADGE_HIDDEN;
+export const LEGACY_BADGE_HIDE_USER_FLAGS_MASK: bigint = LEGACY_STAFF_HIDDEN;
+
+export function legacyHiddenProfileBadges(flags: bigint, premiumFlags: number): Array<ProfileBadgeKind> {
+	const hidden = new Set<ProfileBadgeKind>();
+	if ((flags & LEGACY_STAFF_HIDDEN) !== 0n) hidden.add('staff');
+	const folded = premiumFlags | extractPremiumFlagsFromLegacyUserFlags(flags);
+	for (const [bit, kinds] of LEGACY_PREMIUM_BADGE_HIDE_BITS) {
+		if ((folded & bit) === 0) continue;
+		for (const kind of kinds) hidden.add(kind);
+	}
+	return [...hidden];
+}
+
+export function clearLegacyBadgeHideBits(flags: bigint, premiumFlags: number): {flags: bigint; premiumFlags: number} {
+	return {
+		flags: flags & ~LEGACY_PREMIUM_FLAGS_MASK & ~LEGACY_DEAD_USER_FLAGS_MASK & ~LEGACY_BADGE_HIDE_USER_FLAGS_MASK,
+		premiumFlags:
+			(premiumFlags | extractPremiumFlagsFromLegacyUserFlags(flags)) & ~LEGACY_BADGE_HIDE_PREMIUM_FLAGS_MASK,
+	};
+}
+
 export const PUBLIC_USER_FLAGS =
 	UserFlags.STAFF |
 	UserFlags.PARTNER |
@@ -150,6 +186,19 @@ export const PUBLIC_USER_FLAGS =
 	UserFlags.FRIENDLY_BOT |
 	UserFlags.FRIENDLY_BOT_MANUAL_APPROVAL |
 	UserFlags.SPAMMER;
+const HIDEABLE_FLAG_BADGES: ReadonlyArray<readonly [ProfileBadgeKind, bigint]> = [
+	['staff', UserFlags.STAFF],
+	['partner', UserFlags.PARTNER],
+	['bug_hunter', UserFlags.BUG_HUNTER],
+];
+
+export function stripHiddenProfileBadgeFlags(flags: bigint, hiddenProfileBadges: ReadonlySet<ProfileBadgeKey>): bigint {
+	let visible = flags;
+	for (const [kind, flag] of HIDEABLE_FLAG_BADGES) {
+		if (hiddenProfileBadges.has(kind)) visible &= ~flag;
+	}
+	return visible;
+}
 export const DELETED_USER_USERNAME = 'DeletedUser';
 export const DELETED_USER_GLOBAL_NAME = 'Deleted User';
 export const DELETED_USER_DISCRIMINATOR = 0;
@@ -170,49 +219,6 @@ export const PublicUserFlagsDescriptions: Record<keyof typeof PublicUserFlags, s
 	FRIENDLY_BOT_MANUAL_APPROVAL: 'Bot requires manual approval for friend requests',
 	SPAMMER: 'User is flagged as a spammer',
 };
-export const SuspiciousActivityFlags = {
-	REQUIRE_VERIFIED_EMAIL: 1 << 0,
-	REQUIRE_REVERIFIED_EMAIL: 1 << 1,
-	REQUIRE_VERIFIED_PHONE: 1 << 2,
-	REQUIRE_REVERIFIED_PHONE: 1 << 3,
-	REQUIRE_VERIFIED_EMAIL_OR_VERIFIED_PHONE: 1 << 4,
-	REQUIRE_REVERIFIED_EMAIL_OR_VERIFIED_PHONE: 1 << 5,
-	REQUIRE_VERIFIED_EMAIL_OR_REVERIFIED_PHONE: 1 << 6,
-	REQUIRE_REVERIFIED_EMAIL_OR_REVERIFIED_PHONE: 1 << 7,
-	REQUIRE_INBOUND_PHONE_VERIFICATION: 1 << 8,
-} as const;
-export const SuspiciousActivityFlagsDescriptions: Record<keyof typeof SuspiciousActivityFlags, string> = {
-	REQUIRE_VERIFIED_EMAIL: 'Requires verified email address',
-	REQUIRE_REVERIFIED_EMAIL: 'Requires re-verified email address',
-	REQUIRE_VERIFIED_PHONE: 'Requires verified phone number',
-	REQUIRE_REVERIFIED_PHONE: 'Requires re-verified phone number',
-	REQUIRE_VERIFIED_EMAIL_OR_VERIFIED_PHONE: 'Requires verified email or verified phone',
-	REQUIRE_REVERIFIED_EMAIL_OR_VERIFIED_PHONE: 'Requires re-verified email or re-verified phone',
-	REQUIRE_VERIFIED_EMAIL_OR_REVERIFIED_PHONE: 'Requires verified email or re-verified phone',
-	REQUIRE_REVERIFIED_EMAIL_OR_REVERIFIED_PHONE: 'Requires re-verified email or re-verified phone',
-	REQUIRE_INBOUND_PHONE_VERIFICATION: 'Requires inbound SMS verification (user must text code to platform number)',
-};
-export const ALL_SUSPICIOUS_ACTIVITY_FLAGS = Object.values(SuspiciousActivityFlags).reduce(
-	(mask, flag) => mask | flag,
-	0,
-);
-export const DEFERRED_PHONE_ON_COMMUNITY_JOIN = 1 << 16;
-export const PHONE_GATE_PROMOTED_FROM_DEFERRAL = 1 << 17;
-export const DEFERRABLE_PHONE_FLAGS =
-	SuspiciousActivityFlags.REQUIRE_VERIFIED_PHONE | SuspiciousActivityFlags.REQUIRE_REVERIFIED_PHONE;
-export const NEVER_DEFERRABLE_PHONE_FLAGS = SuspiciousActivityFlags.REQUIRE_INBOUND_PHONE_VERIFICATION;
-export function imposePhoneRequirements(currentFlags: number, addedFlags: number): number {
-	const nextFlags = currentFlags | addedFlags;
-	if ((addedFlags & DEFERRABLE_PHONE_FLAGS) === 0) {
-		return nextFlags;
-	}
-	return nextFlags & ~DEFERRED_PHONE_ON_COMMUNITY_JOIN & ~PHONE_GATE_PROMOTED_FROM_DEFERRAL;
-}
-export const ADMIN_PHONE_TOGGLE_CLEARABLE_FLAGS =
-	DEFERRED_PHONE_ON_COMMUNITY_JOIN |
-	PHONE_GATE_PROMOTED_FROM_DEFERRAL |
-	SuspiciousActivityFlags.REQUIRE_VERIFIED_PHONE |
-	SuspiciousActivityFlags.REQUIRE_INBOUND_PHONE_VERIFICATION;
 export const ThemeTypes = {
 	DARK: 'dark',
 	DARK_LEGACY: 'dark_legacy',

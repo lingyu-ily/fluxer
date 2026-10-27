@@ -18,10 +18,17 @@ export interface DiscoveryGuild {
 	member_count: number;
 	online_count: number;
 	features: Array<string>;
+	badge_ids: Array<string>;
 	verification_level: number;
+	visits_enabled?: boolean;
 }
 
 type DiscoveryGuildPayload = Omit<DiscoveryGuild, 'banner'> & {banner?: string | null};
+
+export interface DiscoveryChannelPreview {
+	guild: {id: string; name: string; icon: string | null};
+	channel: {id: string; name: string | null; type: number};
+}
 
 interface DiscoveryCategoryCountPayload {
 	category_type: number;
@@ -113,6 +120,11 @@ export async function searchGuilds(params: DiscoverySearchParams): Promise<Disco
 
 export async function getCategories(): Promise<Array<DiscoveryCategory>> {
 	return requestDiscoveryCategories();
+}
+
+export async function getChannelPreview(guildId: string, channelId: string): Promise<DiscoveryChannelPreview> {
+	const response = await http.get<DiscoveryChannelPreview>(Endpoints.DISCOVERY_CHANNEL_PREVIEW(guildId, channelId));
+	return response.body;
 }
 
 export async function joinGuild(guildId: string): Promise<void> {

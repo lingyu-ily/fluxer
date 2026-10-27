@@ -56,6 +56,10 @@ class Guilds {
 		}, {});
 	}
 
+	hydrateFromSnapshot(guilds: Array<GuildReadyData>): void {
+		this.handleGatewayReady({guilds});
+	}
+
 	handleGuildCreate(guild: GuildReadyData): void {
 		if (guild.unavailable) {
 			return;
@@ -71,6 +75,7 @@ class Guilds {
 		this.guilds[guild.id] = new Guild({
 			...guild,
 			joined_at: guild.joined_at ?? existingGuild.joinedAt ?? undefined,
+			visiting: existingGuild.visiting ? true : undefined,
 			roles: existingGuild.roles,
 		});
 	}

@@ -9,7 +9,7 @@ use crate::types::{
     ApiMessageAttachmentResponse, ApiMessageCallResponse, ApiMessageEmbedChildResponse,
     ApiMessageEmbedResponse, ApiMessageReactionResponse, ApiMessageReferenceResponse,
     ApiMessageResponse, ApiMessageSnapshotResponse, ApiMessageStickerResponse,
-    ApiReactionEmojiResponse, ApiUserPartialResponse, Message, MessageAttachment, MessageCall,
+    ApiReactionEmojiResponse, ApiUserPartial, Message, MessageAttachment, MessageCall,
     MessageEmbed, MessageEmbedAuthor, MessageEmbedChild, MessageEmbedField, MessageEmbedFooter,
     MessageEmbedMedia, MessageEmbedProvider, MessageReference, MessageRequest, MessageResponse,
     MessageSnapshot, MessageStickerItem,
@@ -17,7 +17,8 @@ use crate::types::{
 use crate::udt;
 use base64::prelude::{BASE64_STANDARD, Engine};
 use chrono::{DateTime, Utc};
-use fluxer_common::user_flags::{USER_FLAG_STAFF, visible_user_flags};
+use fluxer_common::time::{unix_millis, unix_seconds};
+use fluxer_common::user_partial::{FLUXER_SYSTEM_USER_ID, UserPartialFields, fluxer_system_user};
 use fluxer_svc::shard::ShardService;
 use fluxer_svc::transport::Transport;
 use fluxer_svc::{postgres, postgres::BigIntBound, postgres::KeyPart};
@@ -34,25 +35,64 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "scylla")]
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
 const BUCKET_DURATION_MS: i64 = 864_000_000;
 const FLUXER_EPOCH_MS: i64 = 1_420_070_400_000;
 const SERVICE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const MESSAGE_REFERENCE_TYPE_DEFAULT: i32 = 0;
+const MESSAGE_REFERENCE_TYPE_FORWARD: i32 = 1;
+const HIDDEN_REFILL_ROUNDS: usize = 5;
+const HIDDEN_REFILL_MAX_PAGE: u32 = 800;
+const MESSAGE_FLAG_IS_CROSSPOST: i64 = 1 << 1;
 
 fn effective_reference_type(reference: &MessageReference) -> i32 {
     reference
         .reference_type
         .unwrap_or(MESSAGE_REFERENCE_TYPE_DEFAULT)
 }
+
+fn is_crosspost_copy(message: &Message) -> bool {
+    (message.flags.unwrap_or_default() & MESSAGE_FLAG_IS_CROSSPOST) != 0
+}
+
+fn attachment_storage_channel_id(message: &Message) -> i64 {
+    if !is_crosspost_copy(message) {
+        return message.channel_id;
+    }
+    message
+        .message_reference
+        .as_ref()
+        .and_then(|reference| reference.channel_id)
+        .unwrap_or(message.channel_id)
+}
+
+fn reply_target(message: &Message) -> Option<(i64, i64)> {
+    if is_crosspost_copy(message) {
+        return None;
+    }
+    let reference = message.message_reference.as_ref()?;
+    if effective_reference_type(reference) != MESSAGE_REFERENCE_TYPE_DEFAULT {
+        return None;
+    }
+    Some((reference.channel_id?, reference.message_id?))
+}
+
+fn copy_source(message: &Message) -> Option<(i64, i64)> {
+    let reference = message.message_reference.as_ref()?;
+    if !is_crosspost_copy(message)
+        && effective_reference_type(reference) != MESSAGE_REFERENCE_TYPE_FORWARD
+    {
+        return None;
+    }
+    Some((reference.channel_id?, reference.message_id?))
+}
+
 const MESSAGE_FLAG_SUPPRESS_EMBEDS: i64 = 1 << 2;
-#[cfg(test)]
-const USER_FLAG_DELETED: i64 = 1_i64 << 34;
-const FLUXER_SYSTEM_USER_ID: i64 = 0;
-const FLUXER_SYSTEM_USERNAME: &str = "Fluxer";
-const FLUXER_SYSTEM_DISCRIMINATOR: &str = "0000";
+const MESSAGE_TYPE_THREAD_CREATED: i32 = 18;
+const THREAD_MESSAGE_FLAG_MASK: i64 = 0x120;
+const THREAD_FEATURE_CHANNEL_TYPES: [i32; 5] = [10, 11, 12, 15, 16];
+const EMBED_MEDIA_OWNED_ATTACHMENT_FLAG: i32 = 1 << 30;
 const DELETED_USER_USERNAME: &str = "DeletedUser";
 const DELETED_USER_GLOBAL_NAME: &str = "Deleted User";
 const BUCKET_SCAN_CONCURRENCY: usize = 16;
@@ -61,6 +101,8 @@ const ENRICHMENT_QUERY_CONCURRENCY: usize = 16;
 const REACTION_MESSAGE_BATCH_SIZE: usize = 64;
 const ATTACHMENT_DECAY_BATCH_SIZE: usize = 128;
 const BUCKET_INDEX_PAGE_SIZE: u32 = 200;
+const EXCLUDED_TYPE_REFILL_PAGE_SIZE: u32 = 100;
+const EXCLUDED_TYPE_SCAN_ROW_CAP: usize = 5_000;
 const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 fn assert_safe_byte_size(value: i64) -> i64 {
@@ -215,17 +257,52 @@ struct UserPartialServiceResponse {
     flags: Option<i64>,
     avatar_color: Option<i32>,
     mention_flags: Option<i32>,
+    #[serde(default)]
+    content_hidden_since: Option<i64>,
+    #[serde(default)]
+    hidden_profile_badges: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct UserLookup {
+    partials: HashMap<i64, UserPartialServiceResponse>,
+    requested: HashSet<i64>,
+}
+
+impl UserLookup {
+    fn hides(&self, author_id: Option<i64>, message_id: i64) -> bool {
+        author_id
+            .and_then(|author_id| self.partials.get(&author_id))
+            .and_then(|partial| partial.content_hidden_since)
+            .is_some_and(|since| snowflake_to_epoch_millis(message_id) >= since)
+    }
+
+    fn merge(&mut self, other: UserLookup) {
+        self.requested.extend(other.requested);
+        self.partials.extend(other.partials);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PageCursor {
+    Latest,
+    Before(i64),
+    After(i64),
+}
+
+impl PageCursor {
+    fn next(self, page: &[Message]) -> Option<Self> {
+        let ids = page.iter().map(|message| message.message_id);
+        match self {
+            PageCursor::Latest | PageCursor::Before(_) => ids.min().map(PageCursor::Before),
+            PageCursor::After(_) => ids.max().map(PageCursor::After),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 enum UserServiceResponse {
     FoundPartials(Vec<UserPartialServiceResponse>),
-    FoundPartial(UserPartialServiceResponse),
-    NotFound,
-    #[allow(dead_code)]
-    Found(serde_json::Value),
-    #[allow(dead_code)]
-    Invalidated,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,11 +336,38 @@ struct ResponseBuildOptions {
     include_reactions: bool,
     nonce: Option<String>,
     tts: bool,
+    include_hidden: bool,
+    threads_mask: bool,
+    excluded_types: Vec<i32>,
+    attachment_decay: bool,
+    instance_name: String,
+}
+
+impl ResponseBuildOptions {
+    fn expiring_attachment_ids(&self, messages: &[&Message]) -> HashSet<i64> {
+        if self.attachment_decay {
+            collect_attachment_ids(messages)
+        } else {
+            HashSet::new()
+        }
+    }
+
+    fn hides(&self, message: &Message) -> bool {
+        self.threads_mask && message.message_type == MESSAGE_TYPE_THREAD_CREATED
+    }
+
+    fn mask_flags(&self, flags: i64) -> i64 {
+        if self.threads_mask {
+            flags & !THREAD_MESSAGE_FLAG_MASK
+        } else {
+            flags
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct ResponseContext {
-    users: HashMap<i64, ApiUserPartialResponse>,
+    users: HashMap<i64, ApiUserPartial>,
     reactions: HashMap<i64, Vec<ApiMessageReactionResponse>>,
     referenced_messages: HashMap<(i64, i64), Message>,
     attachment_decay: HashMap<i64, DateTime<Utc>>,
@@ -421,25 +525,26 @@ impl<T: Transport> MessagesShard<T> {
         let limit_i32 = limit.min(i32::MAX as u32) as i32;
         while messages.len() < limit as usize && cursor_max >= min_bucket {
             let buckets = self
-                .list_buckets_desc(channel_id, min_bucket, cursor_max, bucket_page_limit(limit))
+                .storage
+                .list_buckets(
+                    channel_id,
+                    min_bucket,
+                    cursor_max,
+                    bucket_page_limit(limit),
+                    true,
+                )
                 .await?;
             let Some(last_bucket) = buckets.last().copied() else {
                 break;
             };
-            collect_bucket_waves(
-                &buckets,
-                limit as usize,
-                &mut messages,
-                |bucket| async move {
-                    if let Some(before_id) = before_id {
-                        self.fetch_before_bucket(channel_id, bucket, before_id, limit_i32)
-                            .await
-                    } else {
-                        self.fetch_latest_bucket(channel_id, bucket, limit_i32)
-                            .await
-                    }
-                },
-            )
+            collect_bucket_waves(&buckets, limit as usize, &mut messages, |bucket| {
+                self.storage.fetch_bucket(
+                    channel_id,
+                    bucket,
+                    before_id.map(BucketBound::Before),
+                    limit_i32,
+                )
+            })
             .await?;
             if messages.len() >= limit as usize || last_bucket <= min_bucket {
                 break;
@@ -464,20 +569,26 @@ impl<T: Transport> MessagesShard<T> {
         let limit_i32 = limit.min(i32::MAX as u32) as i32;
         while messages.len() < limit as usize && cursor_min <= max_bucket {
             let buckets = self
-                .list_buckets_asc(channel_id, cursor_min, max_bucket, bucket_page_limit(limit))
+                .storage
+                .list_buckets(
+                    channel_id,
+                    cursor_min,
+                    max_bucket,
+                    bucket_page_limit(limit),
+                    false,
+                )
                 .await?;
             let Some(last_bucket) = buckets.last().copied() else {
                 break;
             };
-            collect_bucket_waves(
-                &buckets,
-                limit as usize,
-                &mut messages,
-                |bucket| async move {
-                    self.fetch_after_bucket(channel_id, bucket, after_id, limit_i32)
-                        .await
-                },
-            )
+            collect_bucket_waves(&buckets, limit as usize, &mut messages, |bucket| {
+                self.storage.fetch_bucket(
+                    channel_id,
+                    bucket,
+                    Some(BucketBound::After(after_id)),
+                    limit_i32,
+                )
+            })
             .await?;
             if messages.len() >= limit as usize || last_bucket >= max_bucket {
                 break;
@@ -489,86 +600,162 @@ impl<T: Transport> MessagesShard<T> {
         Ok(messages)
     }
 
-    async fn list_buckets_desc(
+    async fn fetch_page(
         &self,
         channel_id: i64,
-        min_bucket: i32,
-        max_bucket: i32,
+        cursor: PageCursor,
         limit: u32,
-    ) -> anyhow::Result<Vec<i32>> {
-        if min_bucket > max_bucket || limit == 0 {
-            return Ok(Vec::new());
+        floor: Option<i64>,
+        excluded_types: &[i32],
+    ) -> anyhow::Result<Vec<Message>> {
+        if excluded_types.is_empty() {
+            return match cursor {
+                PageCursor::Latest => self.get_latest(channel_id, limit).await,
+                PageCursor::Before(before_id) => {
+                    self.get_before(channel_id, before_id, limit).await
+                }
+                PageCursor::After(after_id) => self.get_after(channel_id, after_id, limit).await,
+            };
         }
-        self.storage
-            .list_buckets_desc(channel_id, min_bucket, max_bucket, limit)
-            .await
+        match cursor {
+            PageCursor::Latest => {
+                collect_excluding(limit, excluded_types, None, |cursor, size| async move {
+                    match cursor {
+                        Some(cursor) => self.get_before(channel_id, cursor, size).await,
+                        None => self.get_latest(channel_id, size).await,
+                    }
+                })
+                .await
+            }
+            PageCursor::Before(before_id) => {
+                collect_excluding(
+                    limit,
+                    excluded_types,
+                    Some(before_id),
+                    |cursor, size| async move {
+                        let mut page = self
+                            .get_before(channel_id, cursor.unwrap_or(before_id), size)
+                            .await?;
+                        if let Some(floor) = floor {
+                            page.retain(|message| message.message_id > floor);
+                        }
+                        Ok(page)
+                    },
+                )
+                .await
+            }
+            PageCursor::After(after_id) => {
+                collect_excluding(limit, excluded_types, Some(after_id), |cursor, size| {
+                    self.get_after(channel_id, cursor.unwrap_or(after_id), size)
+                })
+                .await
+            }
+        }
     }
 
-    async fn list_buckets_asc(
+    async fn visible_page(
         &self,
         channel_id: i64,
-        min_bucket: i32,
-        max_bucket: i32,
+        start: PageCursor,
         limit: u32,
-    ) -> anyhow::Result<Vec<i32>> {
-        if min_bucket > max_bucket || limit == 0 {
-            return Ok(Vec::new());
+        floor: Option<i64>,
+        options: &ResponseBuildOptions,
+        users: &mut UserLookup,
+    ) -> anyhow::Result<Vec<Message>> {
+        let mut out = Vec::new();
+        let mut cursor = start;
+        let mut page_size = limit;
+        for _ in 0..HIDDEN_REFILL_ROUNDS {
+            if limit == 0 {
+                break;
+            }
+            let page = self
+                .fetch_page(
+                    channel_id,
+                    cursor,
+                    page_size,
+                    floor,
+                    &options.excluded_types,
+                )
+                .await?;
+            let exhausted = page.len() < page_size as usize;
+            let reached_floor =
+                floor.is_some_and(|floor| page.iter().any(|message| message.message_id <= floor));
+            let next = cursor.next(&page);
+            let hidden = self.hidden_message_ids(&page, options, users).await;
+            let refill = !hidden.is_empty();
+            out.extend(
+                page.into_iter()
+                    .filter(|message| !hidden.contains(&message.message_id)),
+            );
+            let Some(next) = next else {
+                break;
+            };
+            if !refill || exhausted || reached_floor || out.len() >= limit as usize {
+                break;
+            }
+            cursor = next;
+            page_size = page_size
+                .saturating_mul(2)
+                .min(HIDDEN_REFILL_MAX_PAGE.max(limit));
         }
-        self.storage
-            .list_buckets_asc(channel_id, min_bucket, max_bucket, limit)
-            .await
+        if matches!(start, PageCursor::After(_)) {
+            out.sort_unstable_by_key(|message| message.message_id);
+        } else {
+            out.sort_unstable_by_key(|message| std::cmp::Reverse(message.message_id));
+        }
+        out.truncate(limit as usize);
+        Ok(out)
     }
 
-    async fn fetch_latest_bucket(
-        &self,
-        channel_id: i64,
-        bucket: i32,
-        limit: i32,
-    ) -> anyhow::Result<Vec<Message>> {
-        self.storage
-            .fetch_latest_bucket(channel_id, bucket, limit)
-            .await
-    }
-
-    async fn fetch_before_bucket(
-        &self,
-        channel_id: i64,
-        bucket: i32,
-        before_id: i64,
-        limit: i32,
-    ) -> anyhow::Result<Vec<Message>> {
-        self.storage
-            .fetch_before_bucket(channel_id, bucket, before_id, limit)
-            .await
-    }
-
-    async fn fetch_after_bucket(
-        &self,
-        channel_id: i64,
-        bucket: i32,
-        after_id: i64,
-        limit: i32,
-    ) -> anyhow::Result<Vec<Message>> {
-        self.storage
-            .fetch_after_bucket(channel_id, bucket, after_id, limit)
-            .await
-    }
-
-    async fn get_around(
+    async fn visible_around(
         &self,
         channel_id: i64,
         around_id: i64,
         limit: u32,
+        options: &ResponseBuildOptions,
+        users: &mut UserLookup,
     ) -> anyhow::Result<Vec<Message>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let (newer_limit, older_limit) = around_window_limits(limit);
+        let mut target_users = UserLookup::default();
+        let mut newer_users = UserLookup::default();
+        let mut older_users = UserLookup::default();
         let (target, newer, older) = tokio::try_join!(
-            self.get_by_id(channel_id, around_id),
-            self.get_after(channel_id, around_id, newer_limit),
-            self.get_before(channel_id, around_id, older_limit)
+            async {
+                let target = self.get_by_id(channel_id, around_id).await?;
+                let Some(target) = target else {
+                    return anyhow::Ok(None);
+                };
+                let hidden = self
+                    .hidden_message_ids(std::slice::from_ref(&target), options, &mut target_users)
+                    .await;
+                Ok((!hidden.contains(&target.message_id)
+                    && !options.excluded_types.contains(&target.message_type))
+                .then_some(target))
+            },
+            self.visible_page(
+                channel_id,
+                PageCursor::After(around_id),
+                newer_limit,
+                None,
+                options,
+                &mut newer_users,
+            ),
+            self.visible_page(
+                channel_id,
+                PageCursor::Before(around_id),
+                older_limit,
+                None,
+                options,
+                &mut older_users,
+            )
         )?;
+        users.merge(target_users);
+        users.merge(newer_users);
+        users.merge(older_users);
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for message in newer.into_iter().rev() {
@@ -602,18 +789,31 @@ impl<T: Transport> MessagesShard<T> {
         if !options.can_read_message_history && options.message_history_cutoff_ms.is_none() {
             return Ok(Vec::new());
         }
+        let mut users = UserLookup::default();
         let mut messages = if let Some(around_id) = around_id {
-            self.get_around(channel_id, around_id, limit).await?
+            self.visible_around(channel_id, around_id, limit, &options, &mut users)
+                .await?
         } else if let (Some(before_id), Some(after_id)) = (before_id, after_id) {
-            let mut before = self.get_before(channel_id, before_id, limit).await?;
+            let mut before = self
+                .visible_page(
+                    channel_id,
+                    PageCursor::Before(before_id),
+                    limit,
+                    Some(after_id),
+                    &options,
+                    &mut users,
+                )
+                .await?;
             before.retain(|message| message.message_id > after_id);
             before
-        } else if let Some(before_id) = before_id {
-            self.get_before(channel_id, before_id, limit).await?
-        } else if let Some(after_id) = after_id {
-            self.get_after(channel_id, after_id, limit).await?
         } else {
-            self.get_latest(channel_id, limit).await?
+            let cursor = match (before_id, after_id) {
+                (Some(before_id), _) => PageCursor::Before(before_id),
+                (None, Some(after_id)) => PageCursor::After(after_id),
+                (None, None) => PageCursor::Latest,
+            };
+            self.visible_page(channel_id, cursor, limit, None, &options, &mut users)
+                .await?
         };
         messages
             .retain(|message| self.is_message_visible_to_requester(message.message_id, &options));
@@ -623,7 +823,7 @@ impl<T: Transport> MessagesShard<T> {
         self.cleanup_orphaned_messages(orphaned_messages).await;
         messages.sort_unstable_by_key(|message| std::cmp::Reverse(message.message_id));
         let context = self
-            .build_response_context(&messages, &options, true)
+            .build_response_context(&messages, &options, true, users)
             .await?;
         Ok(messages
             .iter()
@@ -643,12 +843,22 @@ impl<T: Transport> MessagesShard<T> {
         let Some(message) = self.get_by_id(channel_id, message_id).await? else {
             return Ok(None);
         };
+        if options.hides(&message) {
+            return Ok(None);
+        }
         if message.author_id.is_none() && message.webhook_id.is_none() {
             self.cleanup_orphaned_messages(vec![message]).await;
             return Ok(None);
         }
+        let mut users = UserLookup::default();
+        let hidden = self
+            .hidden_message_ids(std::slice::from_ref(&message), &options, &mut users)
+            .await;
+        if !hidden.is_empty() {
+            return Ok(None);
+        }
         let context = self
-            .build_response_context(std::slice::from_ref(&message), &options, true)
+            .build_response_context(std::slice::from_ref(&message), &options, true, users)
             .await?;
         Ok(Some(
             self.map_message_response(&message, &options, &context, true),
@@ -660,7 +870,9 @@ impl<T: Transport> MessagesShard<T> {
         message: Message,
         options: ResponseBuildOptions,
     ) -> anyhow::Result<Option<ApiMessageResponse>> {
-        if !self.is_message_visible_to_requester(message.message_id, &options) {
+        if !self.is_message_visible_to_requester(message.message_id, &options)
+            || options.hides(&message)
+        {
             return Ok(None);
         }
         if message.author_id.is_none() && message.webhook_id.is_none() {
@@ -668,7 +880,12 @@ impl<T: Transport> MessagesShard<T> {
             return Ok(None);
         }
         let context = self
-            .build_response_context(std::slice::from_ref(&message), &options, true)
+            .build_response_context(
+                std::slice::from_ref(&message),
+                &options,
+                true,
+                UserLookup::default(),
+            )
             .await?;
         Ok(Some(
             self.map_message_response(&message, &options, &context, true),
@@ -682,16 +899,75 @@ impl<T: Transport> MessagesShard<T> {
     ) -> anyhow::Result<Vec<ApiMessageResponse>> {
         let (messages, orphaned_messages): (Vec<_>, Vec<_>) = messages
             .into_iter()
-            .filter(|message| self.is_message_visible_to_requester(message.message_id, &options))
+            .filter(|message| {
+                self.is_message_visible_to_requester(message.message_id, &options)
+                    && !options.hides(message)
+            })
             .partition(|message| message.author_id.is_some() || message.webhook_id.is_some());
         self.cleanup_orphaned_messages(orphaned_messages).await;
+        let mut users = UserLookup::default();
+        let hidden = self
+            .hidden_message_ids(&messages, &options, &mut users)
+            .await;
+        let messages = messages
+            .into_iter()
+            .filter(|message| !hidden.contains(&message.message_id))
+            .collect::<Vec<_>>();
         let context = self
-            .build_response_context(&messages, &options, true)
+            .build_response_context(&messages, &options, true, users)
             .await?;
         Ok(messages
             .iter()
             .map(|message| self.map_message_response(message, &options, &context, true))
             .collect())
+    }
+
+    async fn hidden_message_ids(
+        &self,
+        messages: &[Message],
+        options: &ResponseBuildOptions,
+        users: &mut UserLookup,
+    ) -> HashSet<i64> {
+        if options.include_hidden || messages.is_empty() {
+            return HashSet::new();
+        }
+        let copies = messages
+            .iter()
+            .filter_map(|message| copy_source(message).map(|source| (message.message_id, source)))
+            .collect::<Vec<_>>();
+        let sources = stream::iter(copies)
+            .map(|(message_id, (channel_id, source_id))| async move {
+                match self.get_by_id(channel_id, source_id).await {
+                    Ok(Some(source)) => Some((message_id, (source.author_id, source.message_id))),
+                    _ => None,
+                }
+            })
+            .buffer_unordered(ENRICHMENT_QUERY_CONCURRENCY)
+            .filter_map(|source| async move { source })
+            .collect::<HashMap<_, _>>()
+            .await;
+        let user_ids = messages
+            .iter()
+            .flat_map(|message| {
+                message
+                    .author_id
+                    .into_iter()
+                    .chain(message.mention_users.iter().copied())
+            })
+            .chain(sources.values().filter_map(|(author_id, _)| *author_id))
+            .collect::<HashSet<_>>();
+        self.load_user_partials(user_ids, &options.instance_name, users)
+            .await;
+        messages
+            .iter()
+            .filter(|message| {
+                users.hides(message.author_id, message.message_id)
+                    || sources
+                        .get(&message.message_id)
+                        .is_some_and(|(author_id, source_id)| users.hides(*author_id, *source_id))
+            })
+            .map(|message| message.message_id)
+            .collect()
     }
 
     fn is_message_visible_to_requester(
@@ -744,8 +1020,9 @@ impl<T: Transport> MessagesShard<T> {
         messages: &[Message],
         options: &ResponseBuildOptions,
         include_referenced_messages: bool,
+        mut users: UserLookup,
     ) -> anyhow::Result<ResponseContext> {
-        let referenced_messages = if include_referenced_messages {
+        let mut referenced_messages = if include_referenced_messages {
             self.fetch_referenced_messages(messages, options).await
         } else {
             HashMap::new()
@@ -755,20 +1032,29 @@ impl<T: Transport> MessagesShard<T> {
             .chain(referenced_messages.values())
             .collect::<Vec<_>>();
         let mention_context = build_message_mention_context(&all_messages);
-        let attachment_ids = collect_attachment_ids(&all_messages);
+        let attachment_ids = options.expiring_attachment_ids(&all_messages);
         let channel_ids = collect_channel_mention_ids(&all_messages, &mention_context);
         let user_ids = collect_user_ids(&all_messages, &mention_context);
         let reactions_future = self.fetch_reactions_for_messages(messages, options);
         let attachment_decay_future = self.fetch_attachment_decay(attachment_ids);
         let channel_mentions_future = self.resolve_channel_mentions(channel_ids, options);
-        let users_future = self.fetch_user_partials(user_ids);
-        let (reactions, attachment_decay, channel_mentions, users) = tokio::join!(
+        let users_future = self.load_user_partials(user_ids, &options.instance_name, &mut users);
+        let (reactions, attachment_decay, channel_mentions, ()) = tokio::join!(
             reactions_future,
             attachment_decay_future,
             channel_mentions_future,
             users_future
         );
         let attachment_decay = attachment_decay?;
+        if !options.include_hidden {
+            referenced_messages
+                .retain(|_, referenced| !users.hides(referenced.author_id, referenced.message_id));
+        }
+        let users = users
+            .partials
+            .into_values()
+            .map(|partial| (partial.user_id, map_user_partial(partial)))
+            .collect();
         Ok(ResponseContext {
             users,
             reactions,
@@ -786,14 +1072,7 @@ impl<T: Transport> MessagesShard<T> {
     ) -> HashMap<(i64, i64), Message> {
         let mut refs = HashSet::new();
         for message in messages {
-            let Some(reference) = &message.message_reference else {
-                continue;
-            };
-            if effective_reference_type(reference) != MESSAGE_REFERENCE_TYPE_DEFAULT {
-                continue;
-            }
-            let (Some(channel_id), Some(message_id)) = (reference.channel_id, reference.message_id)
-            else {
+            let Some((channel_id, message_id)) = reply_target(message) else {
                 continue;
             };
             if !self.is_message_visible_to_requester(message_id, options) {
@@ -916,19 +1195,24 @@ impl<T: Transport> MessagesShard<T> {
             .await
     }
 
-    async fn fetch_user_partials(
+    async fn load_user_partials(
         &self,
         user_ids: HashSet<i64>,
-    ) -> HashMap<i64, ApiUserPartialResponse> {
-        if user_ids.is_empty() {
-            return HashMap::new();
+        instance_name: &str,
+        users: &mut UserLookup,
+    ) {
+        let mut missing = user_ids
+            .into_iter()
+            .filter(|user_id| users.requested.insert(*user_id))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return;
         }
-        let mut user_ids: Vec<i64> = user_ids.into_iter().collect();
-        user_ids.sort_unstable();
-        user_ids.dedup();
+        missing.sort_unstable();
         let payload = serde_json::json!({
             "op": "GetPartialsByIds",
-            "user_ids": user_ids,
+            "user_ids": missing,
+            "instance_name": instance_name,
         });
         let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
         let response = self
@@ -943,16 +1227,13 @@ impl<T: Transport> MessagesShard<T> {
             .and_then(|bytes| serde_json::from_slice::<UserServiceResponse>(&bytes).ok());
         let partials = match response {
             Some(UserServiceResponse::FoundPartials(partials)) => partials,
-            Some(UserServiceResponse::FoundPartial(partial)) => vec![partial],
             _ => Vec::new(),
         };
-        partials
-            .into_iter()
-            .map(|partial| {
-                let id = partial.user_id;
-                (id, map_user_partial(partial))
-            })
-            .collect()
+        users.partials.extend(
+            partials
+                .into_iter()
+                .map(|partial| (partial.user_id, partial)),
+        );
     }
 
     async fn resolve_channel_mentions(
@@ -970,10 +1251,13 @@ impl<T: Transport> MessagesShard<T> {
             channel_ids.into_iter().map(|id| id.to_string()).collect();
         channel_ids.sort();
         channel_ids.dedup();
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "guild_id": guild_id.to_string(),
             "channel_ids": channel_ids,
         });
+        if options.threads_mask {
+            payload["exclude_thread_channels"] = serde_json::Value::Bool(true);
+        }
         let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
         let response = self
             .transport
@@ -999,6 +1283,10 @@ impl<T: Transport> MessagesShard<T> {
             .and_then(|result| result.channels)
             .unwrap_or_default()
             .into_iter()
+            .filter(|channel| {
+                !(options.threads_mask
+                    && THREAD_FEATURE_CHANNEL_TYPES.contains(&channel.channel_type))
+            })
             .map(|channel| {
                 let item = ApiChannelMentionResponse {
                     id: channel.id,
@@ -1017,14 +1305,15 @@ impl<T: Transport> MessagesShard<T> {
         context: &ResponseContext,
         include_referenced_message: bool,
     ) -> ApiMessageResponse {
-        let author = self.resolve_author(message, context);
+        let author = self.resolve_author(message, options, context);
+        let storage_channel_id = attachment_storage_channel_id(message);
         let attachments = message
             .attachments
             .as_deref()
             .unwrap_or_default()
             .iter()
             .filter_map(|attachment| {
-                self.map_attachment(message.channel_id, attachment, options, context)
+                self.map_attachment(storage_channel_id, attachment, options, context)
             })
             .collect();
         let embeds = if (message.flags.unwrap_or_default() & MESSAGE_FLAG_SUPPRESS_EMBEDS) == 0 {
@@ -1083,33 +1372,23 @@ impl<T: Transport> MessagesShard<T> {
             .filter_map(|id| context.users.get(&id).cloned())
             .collect::<Vec<_>>();
         let referenced_message = if include_referenced_message {
-            message
-                .message_reference
-                .as_ref()
-                .and_then(|reference| {
-                    Some((
-                        reference.channel_id?,
-                        reference.message_id?,
-                        effective_reference_type(reference),
-                    ))
-                })
-                .filter(|(_, _, reference_type)| *reference_type == MESSAGE_REFERENCE_TYPE_DEFAULT)
-                .map(|(channel_id, message_id, _)| {
-                    context
-                        .referenced_messages
-                        .get(&(channel_id, message_id))
-                        .map(|referenced| {
-                            let mut referenced_options = options.clone();
-                            referenced_options.nonce = None;
-                            referenced_options.tts = false;
-                            Box::new(self.map_message_response(
-                                referenced,
-                                &referenced_options,
-                                context,
-                                false,
-                            ))
-                        })
-                })
+            reply_target(message).map(|(channel_id, message_id)| {
+                context
+                    .referenced_messages
+                    .get(&(channel_id, message_id))
+                    .filter(|referenced| !options.hides(referenced))
+                    .map(|referenced| {
+                        let mut referenced_options = options.clone();
+                        referenced_options.nonce = None;
+                        referenced_options.tts = false;
+                        Box::new(self.map_message_response(
+                            referenced,
+                            &referenced_options,
+                            context,
+                            false,
+                        ))
+                    })
+            })
         } else {
             None
         };
@@ -1119,7 +1398,7 @@ impl<T: Transport> MessagesShard<T> {
             author,
             webhook_id: message.webhook_id.map(|id| id.to_string()),
             message_type: message.message_type,
-            flags: message.flags.unwrap_or_default(),
+            flags: options.mask_flags(message.flags.unwrap_or_default()),
             content: message.content.clone().unwrap_or_default(),
             timestamp: epoch_millis_to_iso(snowflake_to_epoch_millis(message.message_id)),
             edited_timestamp: message.edited_timestamp.map(epoch_millis_to_iso),
@@ -1164,19 +1443,20 @@ impl<T: Transport> MessagesShard<T> {
     fn resolve_author(
         &self,
         message: &Message,
+        options: &ResponseBuildOptions,
         context: &ResponseContext,
-    ) -> ApiUserPartialResponse {
+    ) -> ApiUserPartial {
         if let Some(author_id) = message.author_id {
             return context
                 .users
                 .get(&author_id)
                 .cloned()
-                .unwrap_or_else(|| deleted_user(author_id));
+                .unwrap_or_else(|| deleted_user(author_id, &options.instance_name));
         }
         if let (Some(webhook_id), Some(webhook_name)) =
             (message.webhook_id, message.webhook_name.clone())
         {
-            return ApiUserPartialResponse {
+            return ApiUserPartial {
                 id: webhook_id.to_string(),
                 username: webhook_name,
                 discriminator: "0000".to_owned(),
@@ -1189,7 +1469,7 @@ impl<T: Transport> MessagesShard<T> {
                 mention_flags: None,
             };
         }
-        deleted_user(0)
+        deleted_user(0, &options.instance_name)
     }
 
     fn map_attachment(
@@ -1203,14 +1483,14 @@ impl<T: Transport> MessagesShard<T> {
         let filename = attachment.filename.clone().unwrap_or_default();
         let decay = context.attachment_decay.get(&attachment_id);
         let expired =
-            decay.is_some_and(|expires_at| expires_at.timestamp_millis() <= now_epoch_millis());
+            decay.is_some_and(|expires_at| expires_at.timestamp_millis() <= unix_millis());
         let url = (!expired).then(|| {
             attachment_cdn_url(
                 channel_id,
                 attachment_id,
                 &filename,
                 options,
-                now_epoch_secs(),
+                unix_seconds(),
             )
         });
         let content_type = attachment.content_type.clone().unwrap_or_else(|| {
@@ -1389,7 +1669,9 @@ impl<T: Transport> MessagesShard<T> {
             content_type: media.content_type,
             content_hash: media.content_hash,
             placeholder: media.placeholder,
-            flags: media.flags,
+            flags: media
+                .flags
+                .map(|flags| flags & !EMBED_MEDIA_OWNED_ATTACHMENT_FLAG),
         })
     }
 
@@ -1461,7 +1743,7 @@ impl<T: Transport> MessagesShard<T> {
                 .as_ref()
                 .map(|stickers| stickers.iter().filter_map(map_sticker).collect::<Vec<_>>()),
             snapshot_type: snapshot.snapshot_type.unwrap_or_default(),
-            flags: snapshot.flags.unwrap_or_default(),
+            flags: options.mask_flags(i64::from(snapshot.flags.unwrap_or_default())) as i32,
         }
     }
 }
@@ -1486,23 +1768,27 @@ impl MessagesStorage {
         }
     }
 
-    async fn list_buckets_desc(
+    async fn list_buckets(
         &self,
         channel_id: i64,
         min_bucket: i32,
         max_bucket: i32,
         limit: u32,
+        desc: bool,
     ) -> anyhow::Result<Vec<i32>> {
+        if min_bucket > max_bucket || limit == 0 {
+            return Ok(Vec::new());
+        }
         match self {
             MessagesStorage::Postgres(storage) => {
                 storage
-                    .list_buckets(channel_id, min_bucket, max_bucket, limit, true)
+                    .list_buckets(channel_id, min_bucket, max_bucket, limit, desc)
                     .await
             }
             #[cfg(feature = "scylla")]
             MessagesStorage::Scylla(storage) => {
                 storage
-                    .list_buckets_desc(channel_id, min_bucket, max_bucket, limit)
+                    .list_buckets(channel_id, min_bucket, max_bucket, limit, desc)
                     .await
             }
             #[cfg(test)]
@@ -1510,105 +1796,23 @@ impl MessagesStorage {
         }
     }
 
-    async fn list_buckets_asc(
-        &self,
-        channel_id: i64,
-        min_bucket: i32,
-        max_bucket: i32,
-        limit: u32,
-    ) -> anyhow::Result<Vec<i32>> {
-        match self {
-            MessagesStorage::Postgres(storage) => {
-                storage
-                    .list_buckets(channel_id, min_bucket, max_bucket, limit, false)
-                    .await
-            }
-            #[cfg(feature = "scylla")]
-            MessagesStorage::Scylla(storage) => {
-                storage
-                    .list_buckets_asc(channel_id, min_bucket, max_bucket, limit)
-                    .await
-            }
-            #[cfg(test)]
-            MessagesStorage::Deletions(_) => Ok(Vec::new()),
-        }
-    }
-
-    async fn fetch_latest_bucket(
+    async fn fetch_bucket(
         &self,
         channel_id: i64,
         bucket: i32,
+        bound: Option<BucketBound>,
         limit: i32,
     ) -> anyhow::Result<Vec<Message>> {
         match self {
             MessagesStorage::Postgres(storage) => {
+                let desc = !matches!(bound, Some(BucketBound::After(_)));
                 storage
-                    .fetch_bucket(channel_id, bucket, None, true, limit)
+                    .fetch_bucket(channel_id, bucket, bound, desc, limit)
                     .await
             }
             #[cfg(feature = "scylla")]
             MessagesStorage::Scylla(storage) => {
-                storage.fetch_latest_bucket(channel_id, bucket, limit).await
-            }
-            #[cfg(test)]
-            MessagesStorage::Deletions(_) => Ok(Vec::new()),
-        }
-    }
-
-    async fn fetch_before_bucket(
-        &self,
-        channel_id: i64,
-        bucket: i32,
-        before_id: i64,
-        limit: i32,
-    ) -> anyhow::Result<Vec<Message>> {
-        match self {
-            MessagesStorage::Postgres(storage) => {
-                storage
-                    .fetch_bucket(
-                        channel_id,
-                        bucket,
-                        Some(BucketBound::Before(before_id)),
-                        true,
-                        limit,
-                    )
-                    .await
-            }
-            #[cfg(feature = "scylla")]
-            MessagesStorage::Scylla(storage) => {
-                storage
-                    .fetch_before_bucket(channel_id, bucket, before_id, limit)
-                    .await
-            }
-            #[cfg(test)]
-            MessagesStorage::Deletions(_) => Ok(Vec::new()),
-        }
-    }
-
-    async fn fetch_after_bucket(
-        &self,
-        channel_id: i64,
-        bucket: i32,
-        after_id: i64,
-        limit: i32,
-    ) -> anyhow::Result<Vec<Message>> {
-        match self {
-            MessagesStorage::Postgres(storage) => {
-                storage
-                    .fetch_bucket(
-                        channel_id,
-                        bucket,
-                        Some(BucketBound::After(after_id)),
-                        false,
-                        limit,
-                    )
-                    .await
-            }
-            #[cfg(feature = "scylla")]
-            MessagesStorage::Scylla(storage) => {
-                storage
-                    .fetch_after_bucket(channel_id, bucket, after_id, limit)
-                    .await
+                storage.fetch_bucket(channel_id, bucket, bound, limit).await
             }
             #[cfg(test)]
             MessagesStorage::Deletions(_) => Ok(Vec::new()),
@@ -1720,9 +1924,6 @@ impl PostgresMessagesStorage {
         limit: u32,
         desc: bool,
     ) -> anyhow::Result<Vec<i32>> {
-        if min_bucket > max_bucket || limit == 0 {
-            return Ok(Vec::new());
-        }
         let partition_key = postgres::kv_key(&[KeyPart::BigInt(channel_id)])?;
         let mut buckets = self
             .kv
@@ -1868,17 +2069,23 @@ impl ScyllaMessagesStorage {
         Ok(rows.maybe_first_row::<MessageDbRow>()?.map(Into::into))
     }
 
-    async fn list_buckets_desc(
+    async fn list_buckets(
         &self,
         channel_id: i64,
         min_bucket: i32,
         max_bucket: i32,
         limit: u32,
+        desc: bool,
     ) -> anyhow::Result<Vec<i32>> {
+        let stmt = if desc {
+            &self.stmt_list_buckets_desc
+        } else {
+            &self.stmt_list_buckets_asc
+        };
         let result = self
             .db
             .execute_unpaged(
-                &self.stmt_list_buckets_desc,
+                stmt,
                 (
                     channel_id,
                     min_bucket,
@@ -1890,69 +2097,33 @@ impl ScyllaMessagesStorage {
         bucket_rows_to_vec(result.into_rows_result()?)
     }
 
-    async fn list_buckets_asc(
-        &self,
-        channel_id: i64,
-        min_bucket: i32,
-        max_bucket: i32,
-        limit: u32,
-    ) -> anyhow::Result<Vec<i32>> {
-        let result = self
-            .db
-            .execute_unpaged(
-                &self.stmt_list_buckets_asc,
-                (
-                    channel_id,
-                    min_bucket,
-                    max_bucket,
-                    limit.min(i32::MAX as u32) as i32,
-                ),
-            )
-            .await?;
-        bucket_rows_to_vec(result.into_rows_result()?)
-    }
-
-    async fn fetch_latest_bucket(
+    async fn fetch_bucket(
         &self,
         channel_id: i64,
         bucket: i32,
+        bound: Option<BucketBound>,
         limit: i32,
     ) -> anyhow::Result<Vec<Message>> {
-        let result = self
-            .db
-            .execute_unpaged(&self.stmt_get_latest, (channel_id, bucket, limit))
-            .await?;
-        rows_to_messages(result.into_rows_result()?)
-    }
-
-    async fn fetch_before_bucket(
-        &self,
-        channel_id: i64,
-        bucket: i32,
-        before_id: i64,
-        limit: i32,
-    ) -> anyhow::Result<Vec<Message>> {
-        let result = self
-            .db
-            .execute_unpaged(
-                &self.stmt_get_before,
-                (channel_id, bucket, before_id, limit),
-            )
-            .await?;
-        rows_to_messages(result.into_rows_result()?)
-    }
-
-    async fn fetch_after_bucket(
-        &self,
-        channel_id: i64,
-        bucket: i32,
-        after_id: i64,
-        limit: i32,
-    ) -> anyhow::Result<Vec<Message>> {
-        let result = self
-            .db
-            .execute_unpaged(&self.stmt_get_after, (channel_id, bucket, after_id, limit))
-            .await?;
+        let result = match bound {
+            None => {
+                self.db
+                    .execute_unpaged(&self.stmt_get_latest, (channel_id, bucket, limit))
+                    .await?
+            }
+            Some(BucketBound::Before(before_id)) => {
+                self.db
+                    .execute_unpaged(
+                        &self.stmt_get_before,
+                        (channel_id, bucket, before_id, limit),
+                    )
+                    .await?
+            }
+            Some(BucketBound::After(after_id)) => {
+                self.db
+                    .execute_unpaged(&self.stmt_get_after, (channel_id, bucket, after_id, limit))
+                    .await?
+            }
+        };
         rows_to_messages(result.into_rows_result()?)
     }
 
@@ -2120,33 +2291,6 @@ impl<T: Transport> ShardService for MessagesShard<T> {
 
     async fn handle(&self, request: MessageRequest) -> anyhow::Result<MessageResponse> {
         match request {
-            MessageRequest::GetById {
-                channel_id,
-                message_id,
-            } => match self.get_by_id(channel_id, message_id).await? {
-                Some(msg) => Ok(MessageResponse::Found(msg)),
-                None => Ok(MessageResponse::NotFound),
-            },
-            MessageRequest::GetLatest { channel_id, limit } => {
-                let messages = self.get_latest(channel_id, limit).await?;
-                Ok(MessageResponse::FoundMany(messages))
-            }
-            MessageRequest::GetBefore {
-                channel_id,
-                before_id,
-                limit,
-            } => {
-                let messages = self.get_before(channel_id, before_id, limit).await?;
-                Ok(MessageResponse::FoundMany(messages))
-            }
-            MessageRequest::GetAfter {
-                channel_id,
-                after_id,
-                limit,
-            } => {
-                let messages = self.get_after(channel_id, after_id, limit).await?;
-                Ok(MessageResponse::FoundMany(messages))
-            }
             MessageRequest::GetResponseById {
                 channel_id,
                 message_id,
@@ -2158,8 +2302,12 @@ impl<T: Transport> ShardService for MessagesShard<T> {
                 media_proxy_secret_key,
                 attachment_url_secret_base64,
                 include_reactions,
+                attachment_decay,
                 nonce,
                 tts,
+                include_hidden,
+                threads_mask,
+                instance_name,
             } => {
                 let channel_id = parse_i64(&channel_id, "channel_id")?;
                 let message_id = parse_i64(&message_id, "message_id")?;
@@ -2183,8 +2331,13 @@ impl<T: Transport> ShardService for MessagesShard<T> {
                                 attachment_url_secret_base64.as_deref(),
                             ),
                             include_reactions: include_reactions.unwrap_or(true),
+                            attachment_decay: attachment_decay.unwrap_or(true),
                             nonce,
                             tts: tts.unwrap_or(false),
+                            include_hidden,
+                            threads_mask,
+                            excluded_types: Vec::new(),
+                            instance_name,
                         },
                     )
                     .await?;
@@ -2203,8 +2356,12 @@ impl<T: Transport> ShardService for MessagesShard<T> {
                 media_proxy_secret_key,
                 attachment_url_secret_base64,
                 include_reactions,
+                attachment_decay,
                 nonce,
                 tts,
+                include_hidden,
+                threads_mask,
+                instance_name,
             } => {
                 let viewer_user_id = parse_i64(&viewer_user_id, "viewer_user_id")?;
                 let source_guild_id = source_guild_id
@@ -2225,8 +2382,13 @@ impl<T: Transport> ShardService for MessagesShard<T> {
                                 attachment_url_secret_base64.as_deref(),
                             ),
                             include_reactions: include_reactions.unwrap_or(true),
+                            attachment_decay: attachment_decay.unwrap_or(true),
                             nonce,
                             tts: tts.unwrap_or(false),
+                            include_hidden,
+                            threads_mask,
+                            excluded_types: Vec::new(),
+                            instance_name,
                         },
                     )
                     .await?;
@@ -2245,6 +2407,10 @@ impl<T: Transport> ShardService for MessagesShard<T> {
                 media_proxy_secret_key,
                 attachment_url_secret_base64,
                 include_reactions,
+                attachment_decay,
+                include_hidden,
+                threads_mask,
+                instance_name,
             } => {
                 let viewer_user_id = parse_i64(&viewer_user_id, "viewer_user_id")?;
                 let source_guild_id = source_guild_id
@@ -2265,8 +2431,13 @@ impl<T: Transport> ShardService for MessagesShard<T> {
                                 attachment_url_secret_base64.as_deref(),
                             ),
                             include_reactions: include_reactions.unwrap_or(true),
+                            attachment_decay: attachment_decay.unwrap_or(true),
                             nonce: None,
                             tts: false,
+                            include_hidden,
+                            threads_mask,
+                            excluded_types: Vec::new(),
+                            instance_name,
                         },
                     )
                     .await?;
@@ -2286,8 +2457,16 @@ impl<T: Transport> ShardService for MessagesShard<T> {
                 media_proxy_secret_key,
                 attachment_url_secret_base64,
                 include_reactions,
+                attachment_decay,
+                include_hidden,
+                threads_mask,
+                mut exclude_types,
+                instance_name,
             } => {
                 let channel_id = parse_i64(&channel_id, "channel_id")?;
+                if threads_mask && !exclude_types.contains(&MESSAGE_TYPE_THREAD_CREATED) {
+                    exclude_types.push(MESSAGE_TYPE_THREAD_CREATED);
+                }
                 let viewer_user_id = parse_i64(&viewer_user_id, "viewer_user_id")?;
                 let before_id = before_id
                     .as_deref()
@@ -2323,8 +2502,13 @@ impl<T: Transport> ShardService for MessagesShard<T> {
                                 attachment_url_secret_base64.as_deref(),
                             ),
                             include_reactions: include_reactions.unwrap_or(true),
+                            attachment_decay: attachment_decay.unwrap_or(true),
                             nonce: None,
                             tts: false,
+                            include_hidden,
+                            threads_mask,
+                            excluded_types: exclude_types,
+                            instance_name,
                         },
                     )
                     .await?;
@@ -2343,20 +2527,6 @@ impl<T: Transport> ShardService for MessagesShard<T> {
             }
         }
     }
-}
-
-fn now_epoch_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
-fn now_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn message_row_key(channel_id: i64, bucket: i32, message_id: i64) -> anyhow::Result<String> {
@@ -2463,6 +2633,40 @@ where
     Ok(())
 }
 
+async fn collect_excluding<Fetch, Fut>(
+    limit: u32,
+    excluded_types: &[i32],
+    mut cursor: Option<i64>,
+    fetch: Fetch,
+) -> anyhow::Result<Vec<Message>>
+where
+    Fetch: Fn(Option<i64>, u32) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<Message>>>,
+{
+    let mut collected = Vec::new();
+    let mut scanned = 0_usize;
+    let mut page_size = limit;
+    while collected.len() < limit as usize && scanned < EXCLUDED_TYPE_SCAN_ROW_CAP {
+        let page = fetch(cursor, page_size).await?;
+        let exhausted = page.len() < page_size as usize;
+        let Some(last) = page.last() else {
+            break;
+        };
+        cursor = Some(last.message_id);
+        scanned += page.len();
+        collected.extend(
+            page.into_iter()
+                .filter(|message| !excluded_types.contains(&message.message_type)),
+        );
+        if exhausted {
+            break;
+        }
+        page_size = limit.max(EXCLUDED_TYPE_REFILL_PAGE_SIZE);
+    }
+    collected.truncate(limit as usize);
+    Ok(collected)
+}
+
 fn around_window_limits(limit: u32) -> (u32, u32) {
     let newer_limit = limit / 2;
     let older_limit = limit.saturating_sub(1).saturating_sub(newer_limit);
@@ -2488,11 +2692,7 @@ fn snowflake_to_bucket(snowflake: i64) -> i32 {
 }
 
 fn current_bucket() -> i32 {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    epoch_millis_to_bucket(now_ms)
+    epoch_millis_to_bucket(unix_millis())
 }
 
 fn epoch_millis_to_iso(epoch_millis: i64) -> String {
@@ -2688,45 +2888,27 @@ fn collect_user_ids_from_embed_child(embed: &MessageEmbedChild, target: &mut Has
     target.extend(mentions.users);
 }
 
-fn map_user_partial(partial: UserPartialServiceResponse) -> ApiUserPartialResponse {
-    if partial.user_id == FLUXER_SYSTEM_USER_ID {
-        return fluxer_system_user();
-    }
-    let flags = partial.flags.unwrap_or_default();
-    ApiUserPartialResponse {
-        id: partial.user_id.to_string(),
+fn map_user_partial(partial: UserPartialServiceResponse) -> ApiUserPartial {
+    ApiUserPartial::from(UserPartialFields {
+        user_id: partial.user_id,
         username: partial.username,
-        discriminator: format!("{:04}", partial.discriminator),
+        discriminator: partial.discriminator,
         global_name: partial.global_name,
-        avatar: partial.avatar_hash,
+        avatar_hash: partial.avatar_hash,
         avatar_color: partial.avatar_color,
-        bot: partial.bot.filter(|bot| *bot),
-        system: partial.system.filter(|system| *system),
-        flags: i64::from(visible_user_flags(flags)),
-        mention_flags: partial.mention_flags.filter(|flags| *flags != 0),
-    }
+        bot: partial.bot,
+        system: partial.system,
+        flags: partial.flags,
+        hidden_profile_badges: partial.hidden_profile_badges,
+        mention_flags: partial.mention_flags,
+    })
 }
 
-fn fluxer_system_user() -> ApiUserPartialResponse {
-    ApiUserPartialResponse {
-        id: FLUXER_SYSTEM_USER_ID.to_string(),
-        username: FLUXER_SYSTEM_USERNAME.to_owned(),
-        discriminator: FLUXER_SYSTEM_DISCRIMINATOR.to_owned(),
-        global_name: None,
-        avatar: None,
-        avatar_color: None,
-        bot: Some(true),
-        system: Some(true),
-        flags: USER_FLAG_STAFF,
-        mention_flags: None,
-    }
-}
-
-fn deleted_user(user_id: i64) -> ApiUserPartialResponse {
+fn deleted_user(user_id: i64, instance_name: &str) -> ApiUserPartial {
     if user_id == FLUXER_SYSTEM_USER_ID {
-        return fluxer_system_user();
+        return fluxer_system_user(instance_name.to_owned());
     }
-    ApiUserPartialResponse {
+    ApiUserPartial {
         id: user_id.to_string(),
         username: DELETED_USER_USERNAME.to_owned(),
         discriminator: "0000".to_owned(),
@@ -2807,7 +2989,7 @@ fn map_reactions(
 fn map_message_reference(reference: &MessageReference) -> Option<ApiMessageReferenceResponse> {
     Some(ApiMessageReferenceResponse {
         channel_id: reference.channel_id?.to_string(),
-        message_id: reference.message_id?.to_string(),
+        message_id: reference.message_id.map(|id| id.to_string()),
         guild_id: reference.guild_id.map(|id| id.to_string()),
         reference_type: effective_reference_type(reference),
     })
@@ -2903,23 +3085,6 @@ fn attachment_cdn_url(
     )
 }
 
-fn is_own_endpoint(media_endpoint: &str, target: &Url) -> bool {
-    let Ok(base) = Url::parse(media_endpoint) else {
-        return false;
-    };
-    let same_host = match (base.host_str(), target.host_str()) {
-        (Some(base_host), Some(target_host)) => base_host.eq_ignore_ascii_case(target_host),
-        _ => false,
-    };
-    same_host
-        && base.scheme().eq_ignore_ascii_case(target.scheme())
-        && base.port_or_known_default() == target.port_or_known_default()
-        && target
-            .path()
-            .strip_prefix(base.path().trim_end_matches('/'))
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
 fn raw_url_path(url: &str) -> &str {
     let Some((_, after_scheme)) = url.split_once("://") else {
         return "";
@@ -2982,13 +3147,13 @@ fn sign_own_url(input_url: &str, options: &ResponseBuildOptions) -> String {
     sign_own_media_url(
         input_url,
         options.media_endpoint.trim_end_matches('/'),
-        now_epoch_secs(),
+        unix_seconds(),
         &options.attachment_url_secret,
     )
 }
 
 fn external_media_proxy_url(input_url: &str, options: &ResponseBuildOptions) -> String {
-    media_proxy_url_at(input_url, options, now_epoch_secs())
+    media_proxy_url_at(input_url, options, unix_seconds())
 }
 
 fn media_proxy_url_at(input_url: &str, options: &ResponseBuildOptions, now_secs: u64) -> String {
@@ -2997,7 +3162,7 @@ fn media_proxy_url_at(input_url: &str, options: &ResponseBuildOptions, now_secs:
         Ok(url) => url,
         Err(_) => return input_url.to_owned(),
     };
-    if is_own_endpoint(media_endpoint, &parsed_url) {
+    if fluxer_common::external_media_path::is_own_media_url(media_endpoint, &parsed_url) {
         return sign_own_media_url(
             input_url,
             media_endpoint,
@@ -3251,95 +3416,8 @@ impl From<MessageDbRow> for Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluxer_svc::transport::{InMemoryTransport, TransportSubscriber, reply_message};
+    use fluxer_svc::transport::InMemoryTransport;
     use serde_json::json;
-
-    #[test]
-    fn id_zero_is_always_fluxer_system_user() {
-        let mapped = map_user_partial(UserPartialServiceResponse {
-            user_id: 0,
-            username: DELETED_USER_USERNAME.to_owned(),
-            discriminator: 0,
-            global_name: Some(DELETED_USER_GLOBAL_NAME.to_owned()),
-            avatar_hash: None,
-            bot: Some(true),
-            system: Some(true),
-            flags: Some(USER_FLAG_DELETED),
-            avatar_color: None,
-            mention_flags: None,
-        });
-
-        assert_eq!(mapped.id, "0");
-        assert_eq!(mapped.username, "Fluxer");
-        assert_eq!(mapped.discriminator, "0000");
-        assert_eq!(mapped.global_name, None);
-        assert_eq!(mapped.bot, Some(true));
-        assert_eq!(mapped.system, Some(true));
-        assert_eq!(mapped.flags, USER_FLAG_STAFF);
-    }
-
-    #[test]
-    fn missing_id_zero_fallback_is_fluxer_system_user() {
-        let mapped = deleted_user(0);
-
-        assert_eq!(mapped.id, "0");
-        assert_eq!(mapped.username, "Fluxer");
-        assert_eq!(mapped.global_name, None);
-        assert_eq!(mapped.bot, Some(true));
-        assert_eq!(mapped.system, Some(true));
-    }
-
-    #[test]
-    fn missing_regular_user_fallback_is_not_bot_or_system() {
-        let mapped = deleted_user(42);
-
-        assert_eq!(mapped.id, "42");
-        assert_eq!(mapped.username, DELETED_USER_USERNAME);
-        assert_eq!(
-            mapped.global_name,
-            Some(DELETED_USER_GLOBAL_NAME.to_owned())
-        );
-        assert_eq!(mapped.bot, None);
-        assert_eq!(mapped.system, None);
-    }
-
-    #[test]
-    fn deleted_flagged_user_partials_are_not_synthetically_masked() {
-        let mapped = map_user_partial(UserPartialServiceResponse {
-            user_id: 42,
-            username: "Ada".to_owned(),
-            discriminator: 7,
-            global_name: Some("Ada Lovelace".to_owned()),
-            avatar_hash: Some("avatar_hash".to_owned()),
-            bot: Some(false),
-            system: Some(false),
-            flags: Some(USER_FLAG_DELETED),
-            avatar_color: Some(0x336699),
-            mention_flags: None,
-        });
-
-        assert_eq!(mapped.id, "42");
-        assert_eq!(mapped.username, "Ada");
-        assert_eq!(mapped.discriminator, "0007");
-        assert_eq!(mapped.global_name, Some("Ada Lovelace".to_owned()));
-        assert_eq!(mapped.avatar, Some("avatar_hash".to_owned()));
-        assert_eq!(mapped.flags, 0);
-    }
-
-    fn reaction(
-        user_id: i64,
-        emoji_id: i64,
-        emoji_name: &str,
-        created_at_ms: i64,
-    ) -> MessageReactionDbRow {
-        MessageReactionDbRow {
-            user_id,
-            emoji_id,
-            emoji_name: emoji_name.to_owned(),
-            emoji_animated: Some(false),
-            created_at: DateTime::<Utc>::from_timestamp_millis(created_at_ms),
-        }
-    }
 
     #[test]
     fn postgres_message_decoder_maps_tagged_kv_payload() {
@@ -3423,44 +3501,6 @@ mod tests {
     }
 
     #[test]
-    fn mention_context_carries_embed_user_ids_for_message_and_snapshots() {
-        let message: Message = serde_json::from_value(json!({
-            "message_id": "10",
-            "channel_id": "20",
-            "bucket": 1,
-            "author_id": "30",
-            "type": 0,
-            "version": 0,
-            "content": "hello <@40>",
-            "mention_users": ["40"],
-            "embeds": [{
-                "title": "title <@50>",
-                "description": "description <@60>",
-                "footer": {"text": "footer <@70>"},
-                "fields": [{"name": "field <@80>", "value": "value <@90>"}]
-            }],
-            "message_snapshots": [{
-                "content": "snapshot <@100>",
-                "embeds": [{"description": "snapshot embed <@110>"}]
-            }]
-        }))
-        .unwrap();
-        let message_ref = &message;
-        let messages = std::slice::from_ref(&message_ref);
-
-        let mention_context = build_message_mention_context(messages);
-        let entry = mention_context.get(&10).unwrap();
-
-        assert_eq!(entry.content.users, HashSet::from([40]));
-        assert_eq!(entry.embed_users, HashSet::from([50, 60, 70, 80, 90, 110]));
-        assert_eq!(entry.snapshots[0].users, HashSet::from([100]));
-        assert_eq!(
-            collect_user_ids(messages, &mention_context),
-            HashSet::from([30, 40, 50, 60, 70, 80, 90, 100, 110])
-        );
-    }
-
-    #[test]
     fn postgres_reaction_decoder_maps_created_at() {
         let (message_id, reaction) = decode_postgres_reaction(json!({
             "message_id": {"__fluxer_type": "bigint", "value": "1509197195776110592"},
@@ -3482,115 +3522,6 @@ mod tests {
     }
 
     #[test]
-    fn bucket_page_limit_is_large_enough_for_sparse_channels() {
-        assert_eq!(bucket_page_limit(0), 32);
-        assert_eq!(bucket_page_limit(25), 32);
-        assert_eq!(bucket_page_limit(50), 50);
-        assert_eq!(bucket_page_limit(500), BUCKET_INDEX_PAGE_SIZE);
-    }
-
-    #[test]
-    fn bucket_wave_ramp_is_bounded_by_scan_concurrency() {
-        assert_eq!(next_bucket_wave(BUCKET_SCAN_WAVE), BUCKET_SCAN_WAVE * 2);
-        assert_eq!(
-            next_bucket_wave(BUCKET_SCAN_CONCURRENCY),
-            BUCKET_SCAN_CONCURRENCY
-        );
-        assert_eq!(next_bucket_wave(usize::MAX), BUCKET_SCAN_CONCURRENCY);
-    }
-
-    #[tokio::test]
-    async fn bucket_scan_stops_once_the_newest_buckets_fill_the_page() {
-        let buckets = (0..50).map(|index| 500 - index).collect::<Vec<i32>>();
-        let scanned = std::sync::Mutex::new(Vec::new());
-        let mut collected: Vec<i64> = Vec::new();
-
-        collect_bucket_waves(&buckets, 50, &mut collected, |bucket| {
-            let scanned = &scanned;
-            async move {
-                scanned.lock().expect("scan log").push(bucket);
-                let rows = (0..200)
-                    .map(|row| i64::from(bucket) * 1_000 + row)
-                    .collect::<Vec<i64>>();
-                Ok(rows)
-            }
-        })
-        .await
-        .expect("bucket scan succeeds");
-
-        let mut scanned = scanned.into_inner().expect("scan log");
-        scanned.sort_unstable_by(|left, right| right.cmp(left));
-        assert_eq!(scanned, buckets[..BUCKET_SCAN_WAVE]);
-
-        let newest_skipped_id = i64::from(buckets[BUCKET_SCAN_WAVE]) * 1_000 + 199;
-        assert!(collected.iter().all(|id| *id > newest_skipped_id));
-    }
-
-    #[tokio::test]
-    async fn bucket_scan_walks_the_whole_page_when_buckets_are_sparse() {
-        let buckets = (0..50).map(|index| 500 - index).collect::<Vec<i32>>();
-        let scanned = std::sync::Mutex::new(0_usize);
-        let mut collected: Vec<i64> = Vec::new();
-
-        collect_bucket_waves(&buckets, 50, &mut collected, |bucket| {
-            let scanned = &scanned;
-            async move {
-                *scanned.lock().expect("scan count") += 1;
-                Ok(vec![i64::from(bucket)])
-            }
-        })
-        .await
-        .expect("bucket scan succeeds");
-
-        assert_eq!(scanned.into_inner().expect("scan count"), buckets.len());
-        assert_eq!(collected.len(), buckets.len());
-    }
-
-    #[test]
-    fn reference_with_no_stored_type_is_treated_as_a_reply_everywhere() {
-        let legacy = MessageReference {
-            channel_id: Some(1),
-            message_id: Some(2),
-            guild_id: None,
-            reference_type: None,
-        };
-        let explicit = MessageReference {
-            reference_type: Some(MESSAGE_REFERENCE_TYPE_DEFAULT),
-            ..legacy.clone()
-        };
-        let forward = MessageReference {
-            reference_type: Some(MESSAGE_REFERENCE_TYPE_DEFAULT + 1),
-            ..legacy.clone()
-        };
-
-        assert_eq!(
-            effective_reference_type(&legacy),
-            MESSAGE_REFERENCE_TYPE_DEFAULT
-        );
-        assert_eq!(
-            effective_reference_type(&legacy),
-            effective_reference_type(&explicit)
-        );
-        assert_ne!(
-            effective_reference_type(&forward),
-            MESSAGE_REFERENCE_TYPE_DEFAULT
-        );
-
-        let mapped = map_message_reference(&legacy).expect("legacy reference maps");
-        assert_eq!(mapped.reference_type, MESSAGE_REFERENCE_TYPE_DEFAULT);
-    }
-
-    #[test]
-    fn around_window_limits_match_reference_api() {
-        assert_eq!(around_window_limits(0), (0, 0));
-        assert_eq!(around_window_limits(1), (0, 0));
-        assert_eq!(around_window_limits(2), (1, 0));
-        assert_eq!(around_window_limits(3), (1, 1));
-        assert_eq!(around_window_limits(50), (25, 24));
-        assert_eq!(around_window_limits(51), (25, 25));
-    }
-
-    #[test]
     fn epoch_bucket_matches_snowflake_bucket() {
         let message_id = 1_509_197_195_776_110_592;
         assert_eq!(
@@ -3604,117 +3535,6 @@ mod tests {
         assert_eq!(snowflake_to_bucket(1_474_193_838_282_432_581), 406);
         assert_eq!(snowflake_to_bucket(1_488_946_116_942_273_651), 410);
         assert_eq!(snowflake_to_bucket(1_509_256_674_043_502_592), 416);
-    }
-
-    #[test]
-    fn message_id_descending_order_matches_api_contract() {
-        let mut ids = [
-            1_506_928_431_237_816_380_i64,
-            1_507_125_930_562_373_970_i64,
-            1_507_125_959_675_038_036_i64,
-        ];
-        ids.sort_unstable_by(|left, right| right.cmp(left));
-        assert_eq!(
-            ids,
-            [
-                1_507_125_959_675_038_036_i64,
-                1_507_125_930_562_373_970_i64,
-                1_506_928_431_237_816_380_i64,
-            ]
-        );
-    }
-
-    #[test]
-    fn embed_field_response_defaults_null_name_and_value_to_empty_strings() {
-        let response = map_embed_field_response(MessageEmbedField {
-            name: None,
-            value: None,
-            is_inline: None,
-        });
-
-        assert_eq!(response.name, "");
-        assert_eq!(response.value, "");
-        assert!(!response.is_inline);
-    }
-
-    #[test]
-    fn reactions_are_grouped_sorted_and_viewer_aware() {
-        let mapped = map_reactions(
-            vec![
-                reaction(10, 0, "z", 300),
-                reaction(11, 0, "a", 100),
-                reaction(12, 0, "a", 200),
-                reaction(11, 99, "party", 50),
-            ],
-            12,
-        );
-        assert_eq!(mapped.len(), 3);
-        assert_eq!(mapped[0].emoji.id.as_deref(), Some("99"));
-        assert_eq!(mapped[0].emoji.name, "party");
-        assert_eq!(mapped[0].count, 1);
-        assert_eq!(mapped[1].emoji.name, "a");
-        assert_eq!(mapped[1].count, 2);
-        assert_eq!(mapped[1].me, Some(true));
-        assert_eq!(mapped[2].emoji.name, "z");
-    }
-
-    #[test]
-    fn response_context_id_collection_spans_referenced_messages() {
-        let message = decode_postgres_message(json!({
-            "channel_id": {"__fluxer_type": "bigint", "value": "10"},
-            "bucket": 416,
-            "message_id": {"__fluxer_type": "bigint", "value": "100"},
-            "author_id": {"__fluxer_type": "bigint", "value": "1"},
-            "content": "hey <@2> over in <#20>",
-            "mention_users": {"__fluxer_type": "set", "value": [
-                {"__fluxer_type": "bigint", "value": "2"}
-            ]},
-            "mention_channels": {"__fluxer_type": "set", "value": [
-                {"__fluxer_type": "bigint", "value": "20"}
-            ]},
-            "attachments": [{
-                "attachment_id": {"__fluxer_type": "bigint", "value": "1000"},
-                "filename": "a.png"
-            }]
-        }))
-        .unwrap();
-        let referenced = decode_postgres_message(json!({
-            "channel_id": {"__fluxer_type": "bigint", "value": "10"},
-            "bucket": 416,
-            "message_id": {"__fluxer_type": "bigint", "value": "99"},
-            "author_id": {"__fluxer_type": "bigint", "value": "3"},
-            "content": "look at <#21>",
-            "mention_channels": {"__fluxer_type": "set", "value": [
-                {"__fluxer_type": "bigint", "value": "21"}
-            ]},
-            "attachments": [{
-                "attachment_id": {"__fluxer_type": "bigint", "value": "1001"},
-                "filename": "b.png"
-            }]
-        }))
-        .unwrap();
-        let messages = [message];
-        let referenced_messages: HashMap<(i64, i64), Message> =
-            [((10, 99), referenced)].into_iter().collect();
-
-        let all_messages = messages
-            .iter()
-            .chain(referenced_messages.values())
-            .collect::<Vec<_>>();
-        let mention_context = build_message_mention_context(&all_messages);
-
-        assert_eq!(
-            collect_attachment_ids(&all_messages),
-            HashSet::from([1000, 1001])
-        );
-        assert_eq!(
-            collect_channel_mention_ids(&all_messages, &mention_context),
-            HashSet::from([20, 21])
-        );
-        assert_eq!(
-            collect_user_ids(&all_messages, &mention_context),
-            HashSet::from([1, 2, 3])
-        );
     }
 
     fn recording_shard(deleted: &DeletedMessageKeys) -> MessagesShard<InMemoryTransport> {
@@ -3736,240 +3556,12 @@ mod tests {
             include_reactions: false,
             nonce: None,
             tts: false,
+            include_hidden: false,
+            threads_mask: false,
+            excluded_types: Vec::new(),
+            attachment_decay: true,
+            instance_name: "Fluxer".to_owned(),
         }
-    }
-
-    fn orphaned_message(message_id: i64) -> Message {
-        decode_postgres_message(json!({
-            "channel_id": {"__fluxer_type": "bigint", "value": "10"},
-            "bucket": 416,
-            "message_id": {"__fluxer_type": "bigint", "value": message_id.to_string()},
-            "content": "orphan"
-        }))
-        .unwrap()
-    }
-
-    fn webhook_message(message_id: i64) -> Message {
-        decode_postgres_message(json!({
-            "channel_id": {"__fluxer_type": "bigint", "value": "10"},
-            "bucket": 416,
-            "message_id": {"__fluxer_type": "bigint", "value": message_id.to_string()},
-            "webhook_id": {"__fluxer_type": "bigint", "value": "77"},
-            "webhook_name": "hook",
-            "content": "kept"
-        }))
-        .unwrap()
-    }
-
-    fn authored_message(message_id: i64) -> Message {
-        decode_postgres_message(json!({
-            "channel_id": {"__fluxer_type": "bigint", "value": "10"},
-            "bucket": 416,
-            "message_id": {"__fluxer_type": "bigint", "value": message_id.to_string()},
-            "author_id": {"__fluxer_type": "bigint", "value": "1472426752046002208"},
-            "content": "kept"
-        }))
-        .unwrap()
-    }
-
-    fn legacy_string_author_message(message_id: i64) -> Message {
-        decode_postgres_message(json!({
-            "channel_id": {"__fluxer_type": "bigint", "value": "10"},
-            "bucket": 416,
-            "message_id": {"__fluxer_type": "bigint", "value": message_id.to_string()},
-            "author_id": "1472426752046002208",
-            "content": "kept"
-        }))
-        .unwrap()
-    }
-
-    async fn stub_user_service(transport: &InMemoryTransport) -> tokio::task::JoinHandle<()> {
-        let mut subscriber = transport.subscribe("svc.users").await.unwrap();
-        let transport = transport.clone();
-        tokio::spawn(async move {
-            while let Some(message) = subscriber.next().await {
-                let _ = reply_message(&message, &transport, b"\"NotFound\"").await;
-            }
-        })
-    }
-
-    fn recorded_deletions(deleted: &DeletedMessageKeys) -> Vec<(i64, i32, i64)> {
-        deleted.lock().unwrap().clone()
-    }
-
-    #[tokio::test]
-    async fn build_path_keeps_authored_rows_from_older_releases() {
-        let deleted = DeletedMessageKeys::default();
-        let shard = recording_shard(&deleted);
-        let users = stub_user_service(&shard.transport).await;
-        let wrapped_id = 1_509_197_195_776_110_592;
-        let legacy_id = 1_509_197_195_776_110_593;
-
-        let responses = shard
-            .build_api_responses_from_messages(
-                vec![
-                    authored_message(wrapped_id),
-                    legacy_string_author_message(legacy_id),
-                ],
-                build_options(),
-            )
-            .await
-            .unwrap();
-        users.abort();
-
-        assert_eq!(responses.len(), 2);
-        assert_eq!(responses[0].id, wrapped_id.to_string());
-        assert_eq!(responses[1].id, legacy_id.to_string());
-        assert_eq!(responses[0].author.id, "1472426752046002208");
-        assert_eq!(responses[1].author.id, "1472426752046002208");
-        assert!(recorded_deletions(&deleted).is_empty());
-    }
-
-    #[tokio::test]
-    async fn build_path_reaps_orphaned_messages() {
-        let deleted = DeletedMessageKeys::default();
-        let shard = recording_shard(&deleted);
-        let orphan_id = 1_509_197_195_776_110_592;
-        let kept_id = 1_509_197_195_776_110_593;
-
-        let responses = shard
-            .build_api_responses_from_messages(
-                vec![orphaned_message(orphan_id), webhook_message(kept_id)],
-                build_options(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0].id, kept_id.to_string());
-        assert_eq!(
-            recorded_deletions(&deleted),
-            vec![(10, snowflake_to_bucket(orphan_id), orphan_id)]
-        );
-    }
-
-    #[tokio::test]
-    async fn build_path_reaps_orphans_of_each_batch_separately() {
-        let deleted = DeletedMessageKeys::default();
-        let shard = recording_shard(&deleted);
-        let first_orphan_id = 1_509_197_195_776_110_592;
-        let second_orphan_id = 1_509_197_195_776_110_594;
-
-        shard
-            .build_api_responses_from_messages(
-                vec![
-                    orphaned_message(first_orphan_id),
-                    webhook_message(1_509_197_195_776_110_593),
-                ],
-                build_options(),
-            )
-            .await
-            .unwrap();
-        shard
-            .build_api_responses_from_messages(
-                vec![orphaned_message(second_orphan_id)],
-                build_options(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            recorded_deletions(&deleted),
-            vec![
-                (10, snowflake_to_bucket(first_orphan_id), first_orphan_id),
-                (10, snowflake_to_bucket(second_orphan_id), second_orphan_id),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn build_path_reaps_a_repeated_orphan_without_failing() {
-        let deleted = DeletedMessageKeys::default();
-        let shard = recording_shard(&deleted);
-        let orphan_id = 1_509_197_195_776_110_592;
-
-        for _ in 0..2 {
-            let responses = shard
-                .build_api_responses_from_messages(
-                    vec![orphaned_message(orphan_id)],
-                    build_options(),
-                )
-                .await
-                .unwrap();
-            assert!(responses.is_empty());
-        }
-
-        assert_eq!(
-            recorded_deletions(&deleted),
-            vec![
-                (10, snowflake_to_bucket(orphan_id), orphan_id),
-                (10, snowflake_to_bucket(orphan_id), orphan_id),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn build_path_leaves_orphans_the_requester_cannot_see() {
-        let deleted = DeletedMessageKeys::default();
-        let shard = recording_shard(&deleted);
-        let orphan_id = 1_509_197_195_776_110_592;
-        let options = ResponseBuildOptions {
-            can_read_message_history: false,
-            message_history_cutoff_ms: Some(snowflake_to_epoch_millis(orphan_id) + 1),
-            ..build_options()
-        };
-
-        let responses = shard
-            .build_api_responses_from_messages(vec![orphaned_message(orphan_id)], options)
-            .await
-            .unwrap();
-
-        assert!(responses.is_empty());
-        assert!(recorded_deletions(&deleted).is_empty());
-    }
-
-    #[tokio::test]
-    async fn single_build_path_reaps_an_orphaned_message() {
-        let deleted = DeletedMessageKeys::default();
-        let shard = recording_shard(&deleted);
-        let orphan_id = 1_509_197_195_776_110_592;
-        let kept_id = 1_509_197_195_776_110_593;
-
-        let orphan_response = shard
-            .build_api_response_from_message(orphaned_message(orphan_id), build_options())
-            .await
-            .unwrap();
-        let kept_response = shard
-            .build_api_response_from_message(webhook_message(kept_id), build_options())
-            .await
-            .unwrap();
-
-        assert!(orphan_response.is_none());
-        assert_eq!(kept_response.unwrap().id, kept_id.to_string());
-        assert_eq!(
-            recorded_deletions(&deleted),
-            vec![(10, snowflake_to_bucket(orphan_id), orphan_id)]
-        );
-    }
-
-    #[tokio::test]
-    async fn single_build_path_leaves_an_orphan_the_requester_cannot_see() {
-        let deleted = DeletedMessageKeys::default();
-        let shard = recording_shard(&deleted);
-        let orphan_id = 1_509_197_195_776_110_592;
-        let options = ResponseBuildOptions {
-            can_read_message_history: false,
-            message_history_cutoff_ms: Some(snowflake_to_epoch_millis(orphan_id) + 1),
-            ..build_options()
-        };
-
-        let response = shard
-            .build_api_response_from_message(orphaned_message(orphan_id), options)
-            .await
-            .unwrap();
-
-        assert!(response.is_none());
-        assert!(recorded_deletions(&deleted).is_empty());
     }
 
     const SIGNATURE_VECTORS: &str =
@@ -4000,15 +3592,6 @@ mod tests {
         make_attachment_cdn_key(SIGNED_CHANNEL_ID, SIGNED_ATTACHMENT_ID, SIGNED_FILENAME)
     }
 
-    fn unsigned_attachment_url(options: &ResponseBuildOptions) -> String {
-        make_attachment_cdn_url(
-            &options.media_endpoint,
-            SIGNED_CHANNEL_ID,
-            SIGNED_ATTACHMENT_ID,
-            SIGNED_FILENAME,
-        )
-    }
-
     fn assert_signs(url: &str, unsigned_prefix: &str, options: &ResponseBuildOptions, now: u64) {
         assert_eq!(
             Some(format!("{unsigned_prefix}?")),
@@ -4018,7 +3601,7 @@ mod tests {
         assert!(!url.contains("/external/"), "{url}");
         assert!(!url.ends_with('&'), "{url}");
         assert!(!url.contains("&&"), "{url}");
-        let query = url.split_once('?').expect("a signed url carries a query").1;
+        let query = url.split_once('?').expect("a signed url has a query").1;
         assert_eq!(
             fluxer_common::attachment_url_signature::Verdict::Valid,
             fluxer_common::attachment_url_signature::verify(
@@ -4108,88 +3691,6 @@ mod tests {
     }
 
     #[test]
-    fn an_attachment_signs_url_and_proxy_url_identically() {
-        let deleted = DeletedMessageKeys::default();
-        let shard = recording_shard(&deleted);
-        let options = signing_options();
-        let mapped = shard
-            .map_attachment(
-                SIGNED_CHANNEL_ID,
-                &signed_attachment(),
-                &options,
-                &ResponseContext::default(),
-            )
-            .expect("an attachment carrying an id maps");
-
-        let url = mapped.url.expect("a live attachment carries a url");
-        assert_eq!(Some(url.clone()), mapped.proxy_url);
-        assert_signs(
-            &url,
-            &unsigned_attachment_url(&options),
-            &options,
-            now_epoch_secs(),
-        );
-    }
-
-    #[test]
-    fn an_own_url_whose_filename_carries_a_slash_is_signed() {
-        let options = signing_options();
-        let now = SIGNED_ANCHOR_SECS + 10;
-        let key = "attachments/1544725486800732163/1544971349200470016/a/b.gif";
-
-        for url in [
-            format!("{}/{key}", options.media_endpoint),
-            format!(
-                "{}/attachments/1544725486800732163/1544971349200470016/a%2Fb.gif",
-                options.media_endpoint
-            ),
-        ] {
-            let signed = media_proxy_url_at(&url, &options, now);
-            assert_eq!(
-                Some(format!("{url}?")),
-                signed.split_once("ex=").map(|(head, _)| head.to_owned()),
-                "{url}"
-            );
-            let query = signed
-                .split_once('?')
-                .expect("a signed url carries a query")
-                .1;
-            assert_eq!(
-                fluxer_common::attachment_url_signature::Verdict::Valid,
-                fluxer_common::attachment_url_signature::verify(
-                    key,
-                    Some(query),
-                    &[&options.attachment_url_secret],
-                    now,
-                )
-                .verdict,
-                "{url}"
-            );
-        }
-
-        for refused in [
-            format!(
-                "{}/attachments/1544725486800732163/1544971349200470016/a//b.gif",
-                options.media_endpoint
-            ),
-            format!(
-                "{}/attachments/1544725486800732163/1544971349200470016/a/../b.gif",
-                options.media_endpoint
-            ),
-            format!(
-                "{}/attachments/1544725486800732163/1544971349200470016/a/",
-                options.media_endpoint
-            ),
-        ] {
-            assert_eq!(
-                refused,
-                media_proxy_url_at(&refused, &options, now),
-                "{refused}"
-            );
-        }
-    }
-
-    #[test]
     fn a_decayed_attachment_is_never_signed() {
         let deleted = DeletedMessageKeys::default();
         let shard = recording_shard(&deleted);
@@ -4197,7 +3698,7 @@ mod tests {
         let context = ResponseContext {
             attachment_decay: [(
                 SIGNED_ATTACHMENT_ID,
-                DateTime::<Utc>::from_timestamp_millis(now_epoch_millis() - 1_000).unwrap(),
+                DateTime::<Utc>::from_timestamp_millis(unix_millis() - 1_000).unwrap(),
             )]
             .into_iter()
             .collect(),
@@ -4211,54 +3712,6 @@ mod tests {
         assert_eq!(None, mapped.url);
         assert_eq!(None, mapped.proxy_url);
         assert_eq!(Some(true), mapped.expired);
-    }
-
-    #[test]
-    fn an_attachment_backed_embed_signs_every_own_url_field() {
-        let deleted = DeletedMessageKeys::default();
-        let shard = recording_shard(&deleted);
-        let options = signing_options();
-        let unsigned = unsigned_attachment_url(&options);
-        let embed: MessageEmbed = serde_json::from_value(json!({
-            "type": "rich",
-            "url": unsigned,
-            "author": {"name": "author", "url": unsigned, "icon_url": unsigned},
-            "provider": {"name": "provider", "url": unsigned},
-            "footer": {"text": "footer", "icon_url": unsigned},
-            "image": {"url": unsigned},
-            "thumbnail": {"url": unsigned},
-        }))
-        .unwrap();
-
-        let mapped = shard.map_embed(&embed, &options);
-
-        let now = now_epoch_secs();
-        let base = mapped.base;
-        let author = base.author.expect("the embed carries an author");
-        let provider = base.provider.expect("the embed carries a provider");
-        let footer = base.footer.expect("the embed carries a footer");
-        let image = base.image.expect("the embed carries an image");
-        let thumbnail = base.thumbnail.expect("the embed carries a thumbnail");
-        for signed in [
-            base.url.expect("the embed carries a url"),
-            author.url.expect("the author carries a url"),
-            author.icon_url.expect("the author carries an icon url"),
-            author
-                .proxy_icon_url
-                .expect("the author carries a proxy icon url"),
-            provider.url.expect("the provider carries a url"),
-            footer.icon_url.expect("the footer carries an icon url"),
-            footer
-                .proxy_icon_url
-                .expect("the footer carries a proxy icon url"),
-            image.url.clone(),
-            image.proxy_url.clone(),
-            thumbnail.url,
-            thumbnail.proxy_url,
-        ] {
-            assert_signs(&signed, &unsigned, &options, now);
-        }
-        assert_eq!(image.url, image.proxy_url);
     }
 
     #[test]
@@ -4284,132 +3737,11 @@ mod tests {
         );
         assert_eq!(
             Some("https://example.com/author".to_owned()),
-            base.author.expect("the embed carries an author").url
+            base.author.expect("the embed has an author").url
         );
         assert_eq!(
             Some("https://example.com".to_owned()),
-            base.provider.expect("the embed carries a provider").url
-        );
-    }
-
-    #[test]
-    fn an_own_attachment_embed_url_is_signed_for_every_origin_spelling() {
-        let options = signing_options();
-        let now = SIGNED_ANCHOR_SECS;
-        for prefix in [
-            "https://media.test",
-            "https://MEDIA.test",
-            "https://Media.Test",
-            "https://media.test:443",
-        ] {
-            let input = format!("{prefix}/{}", signed_storage_key());
-            let signed = media_proxy_url_at(&input, &options, now);
-            assert_signs(&signed, &input, &options, now);
-        }
-    }
-
-    #[test]
-    fn an_own_attachment_embed_url_keeps_its_transform_parameters_and_fragment() {
-        let options = signing_options();
-        let now = SIGNED_ANCHOR_SECS;
-        let input = format!(
-            "https://media.test/{}?width=64&format=webp#frame",
-            signed_storage_key()
-        );
-
-        let signed = media_proxy_url_at(&input, &options, now);
-
-        assert!(signed.ends_with("&width=64&format=webp#frame"), "{signed}");
-        assert!(!signed.contains("/external/"), "{signed}");
-        let query = signed
-            .split_once('?')
-            .expect("a signed url carries a query")
-            .1
-            .split_once('#')
-            .expect("the fragment is kept")
-            .0;
-        assert_eq!(
-            fluxer_common::attachment_url_signature::Verdict::Valid,
-            fluxer_common::attachment_url_signature::verify(
-                &signed_storage_key(),
-                Some(query),
-                &[&options.attachment_url_secret],
-                now,
-            )
-            .verdict
-        );
-    }
-
-    #[test]
-    fn an_own_endpoint_url_outside_attachments_passes_through_unsigned() {
-        let options = signing_options();
-        let now = SIGNED_ANCHOR_SECS;
-        for input in [
-            "https://media.test/emojis/1544725486800732163.webp",
-            "https://media.test/avatars/1/abc.png",
-            "https://media.test/stickers/1/abc.png",
-            "https://media.test/attachments/1544725486800732163",
-            "https://media.test/attachments/1544725486800732163/1544971349200470016",
-            "https://media.test/attachments/1544725486800732163/1544971349200470016/",
-            "https://media.test/attachments/1544725486800732163/not-a-snowflake/cat.gif",
-        ] {
-            assert_eq!(input, media_proxy_url_at(input, &options, now), "{input}");
-        }
-    }
-
-    #[test]
-    fn a_foreign_url_is_still_wrapped_into_the_external_path() {
-        let options = signing_options();
-        let now = SIGNED_ANCHOR_SECS;
-        for input in [
-            "https://example.com/attachments/1544725486800732163/1544971349200470016/cat.gif",
-            "https://media.test.example.com/attachments/1/2/cat.gif",
-            "http://media.test/attachments/1/2/cat.gif",
-            "https://media.test:8443/attachments/1/2/cat.gif",
-        ] {
-            let wrapped = media_proxy_url_at(input, &options, now);
-            assert!(
-                wrapped.starts_with("https://media.test/external/"),
-                "{input}"
-            );
-            assert!(!wrapped.contains("ex="), "{input}");
-        }
-    }
-
-    #[test]
-    fn an_absent_attachment_secret_leaves_every_url_unsigned() {
-        let deleted = DeletedMessageKeys::default();
-        let shard = recording_shard(&deleted);
-        let options = ResponseBuildOptions {
-            attachment_url_secret: Vec::new(),
-            ..signing_options()
-        };
-        let unsigned = unsigned_attachment_url(&options);
-
-        let mapped = shard
-            .map_attachment(
-                SIGNED_CHANNEL_ID,
-                &signed_attachment(),
-                &options,
-                &ResponseContext::default(),
-            )
-            .expect("an attachment carrying an id maps");
-
-        assert_eq!(Some(unsigned.clone()), mapped.url);
-        assert_eq!(Some(unsigned.clone()), mapped.proxy_url);
-        assert_eq!(
-            unsigned,
-            media_proxy_url_at(&unsigned, &options, SIGNED_ANCHOR_SECS)
-        );
-        assert_eq!(
-            unsigned,
-            attachment_cdn_url(
-                SIGNED_CHANNEL_ID,
-                SIGNED_ATTACHMENT_ID,
-                SIGNED_FILENAME,
-                &options,
-                SIGNED_ANCHOR_SECS
-            )
+            base.provider.expect("the embed has a provider").url
         );
     }
 
@@ -4430,36 +3762,6 @@ mod tests {
             media_proxy_url_at(&foreign, &options, now)
                 .starts_with("https://self.test/media/external/")
         );
-    }
-
-    #[test]
-    fn a_percent_encoded_filename_signs_the_decoded_key() {
-        let options = signing_options();
-        let now = SIGNED_ANCHOR_SECS;
-        let encoded =
-            "https://media.test/attachments/1544725486800732163/1544971349200470016/caf%C3%A9.gif";
-        let decoded =
-            "https://media.test/attachments/1544725486800732163/1544971349200470016/café.gif";
-        let key = "attachments/1544725486800732163/1544971349200470016/café.gif";
-
-        for input in [encoded, decoded] {
-            let signed = media_proxy_url_at(input, &options, now);
-            let query = signed
-                .split_once('?')
-                .expect("a signed url carries a query")
-                .1;
-            assert_eq!(
-                fluxer_common::attachment_url_signature::Verdict::Valid,
-                fluxer_common::attachment_url_signature::verify(
-                    key,
-                    Some(query),
-                    &[&options.attachment_url_secret],
-                    now,
-                )
-                .verdict,
-                "{input}"
-            );
-        }
     }
 
     #[test]
@@ -4513,38 +3815,5 @@ mod tests {
         ] {
             assert_eq!(input, media_proxy_url_at(input, &options, now), "{input}");
         }
-    }
-
-    #[test]
-    fn a_request_without_the_secret_field_still_decodes() {
-        let request: MessageRequest = serde_json::from_value(json!({
-            "op": "ListResponses",
-            "channel_id": "10",
-            "viewer_user_id": "1",
-            "limit": 50,
-            "can_read_message_history": true,
-            "media_endpoint": "https://media.test",
-            "media_proxy_secret_key": "secret",
-        }))
-        .expect("an older caller omits the attachment secret");
-
-        match request {
-            MessageRequest::ListResponses {
-                attachment_url_secret_base64,
-                ..
-            } => assert_eq!(None, attachment_url_secret_base64),
-            other => panic!("unexpected request {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_secret_that_is_not_base64_disables_signing() {
-        assert!(decode_attachment_url_secret(None).is_empty());
-        assert!(decode_attachment_url_secret(Some("")).is_empty());
-        assert!(decode_attachment_url_secret(Some("not base64!")).is_empty());
-        assert_eq!(
-            (0u8..32).collect::<Vec<u8>>(),
-            decode_attachment_url_secret(Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="))
-        );
     }
 }

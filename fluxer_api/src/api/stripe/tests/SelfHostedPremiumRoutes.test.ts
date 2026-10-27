@@ -6,6 +6,7 @@ import {getConfig} from '@app/api/Config';
 import {getCachedInstancePremiumMode, setCachedInstancePremiumMode} from '@app/api/limits/InstancePremiumModeCache';
 import {getInstanceConfigRepository, getLimitConfigService} from '@app/api/middleware/ServiceSingletons';
 import {getStoredBillingConfig, setStoredBillingConfig} from '@app/api/stripe/BillingConfigCache';
+import {signStripeWebhook} from '@app/api/stripe/tests/StripeWebhookTestUtils';
 import {type ApiTestHarness, createApiTestHarness} from '@app/api/test/ApiTestHarness';
 import {createStripeApiHandlers} from '@app/api/test/msw/handlers/StripeApiHandlers';
 import {server} from '@app/api/test/msw/server';
@@ -54,12 +55,6 @@ function restoreGlobalState(state: GlobalState): void {
 	config.stripe.prices = state.prices;
 	setCachedInstancePremiumMode(state.premiumMode);
 	setStoredBillingConfig(state.storedBilling);
-}
-
-function signWebhook(payload: string, secret: string): string {
-	const timestamp = Math.floor(Date.now() / 1000);
-	const signature = crypto.createHmac('sha256', secret).update(`${timestamp}.${payload}`).digest('hex');
-	return `t=${timestamp},v1=${signature}`;
 }
 
 function webhookPayload(): string {
@@ -120,7 +115,7 @@ async function postSignedWebhook(harness: ApiTestHarness, secret: string): Promi
 	const payload = webhookPayload();
 	const {response} = await createBuilderWithoutAuth(harness)
 		.post('/stripe/webhook')
-		.header('stripe-signature', signWebhook(payload, secret))
+		.header('stripe-signature', signStripeWebhook(payload, Math.floor(Date.now() / 1000), secret))
 		.header('content-type', 'application/json')
 		.body(payload)
 		.executeRaw();
@@ -134,8 +129,14 @@ async function readRouteStatus(
 	path: string,
 ): Promise<{status: number; code: string | undefined}> {
 	const builder = token === null ? createBuilderWithoutAuth(harness) : createBuilder(harness, token);
-	const request =
-		method === 'GET' ? builder.get(path) : method === 'DELETE' ? builder.delete(path) : builder.post(path).body({});
+	let request: typeof builder;
+	if (method === 'GET') {
+		request = builder.get(path);
+	} else if (method === 'DELETE') {
+		request = builder.delete(path);
+	} else {
+		request = builder.post(path).body({});
+	}
 	const {response, json} = await request.executeRaw();
 	return {status: response.status, code: (json as {code?: string} | undefined)?.code};
 }
@@ -144,8 +145,6 @@ type RouteMethod = 'GET' | 'POST' | 'DELETE';
 
 const PURCHASE_ROUTES: ReadonlyArray<[RouteMethod, string]> = [
 	['POST', '/stripe/checkout/subscription'],
-	['POST', '/stripe/checkout/subscription/preapproval'],
-	['POST', '/stripe/checkout/subscription/preapproval/continue'],
 	['POST', '/stripe/checkout/gift'],
 	['GET', '/premium/price-ids'],
 ];
@@ -169,7 +168,6 @@ const GIFT_ROUTES: ReadonlyArray<[RouteMethod, string]> = [
 ];
 
 const HOSTED_ONLY_ROUTES: ReadonlyArray<[RouteMethod, string]> = [
-	['POST', '/users/@me/age-verification'],
 	['GET', '/premium/refund-eligibility'],
 	['POST', '/premium/refund-latest'],
 	['POST', '/premium/switch-to-list-price'],
@@ -200,6 +198,7 @@ describe('self-hosted premium routes', () => {
 
 	beforeEach(async () => {
 		await harness.reset();
+		await getInstanceConfigRepository().setAppPublicConfig({setup: {configured: true}});
 		setStoredBillingConfig(null);
 		setCachedInstancePremiumMode('everyone');
 	});
@@ -284,6 +283,22 @@ describe('self-hosted premium routes', () => {
 			expect(gifts).toEqual([]);
 		});
 
+		test('credits admin generated gift codes to the issuing admin', async () => {
+			const admin = await setUserACLs(harness, await createTestAccount(harness), [
+				AdminACLs.AUTHENTICATE,
+				AdminACLs.GIFT_CODES_GENERATE,
+			]);
+			const {codes} = await createBuilder<{codes: Array<string>}>(harness, admin.token)
+				.post('/admin/gift-codes')
+				.body({count: 1, duration_type: 'months', duration_quantity: 1})
+				.execute();
+			const code = codes[0]?.split('/').pop();
+			const gift = await createBuilderWithoutAuth<{created_by: {id: string} | null}>(harness)
+				.get(`/gifts/${code}`)
+				.execute();
+			expect(gift.created_by?.id).toBe(admin.userId);
+		});
+
 		test('keeps purchase and hosted-only routes unavailable', async () => {
 			const account = await createTestAccount(harness);
 			await expectRoutesNotFound(harness, account.token, [
@@ -356,14 +371,14 @@ describe('self-hosted premium routes', () => {
 			const payload = webhookPayload();
 			const accepted = await createBuilderWithoutAuth(harness)
 				.post('/stripe/webhook')
-				.header('stripe-signature', signWebhook(payload, OPERATOR_WEBHOOK_SECRET))
+				.header('stripe-signature', signStripeWebhook(payload, Math.floor(Date.now() / 1000), OPERATOR_WEBHOOK_SECRET))
 				.header('content-type', 'application/json')
 				.body(payload)
 				.executeRaw();
 			expect(accepted.response.status).toBe(HTTP_STATUS.OK);
 			const rejected = await createBuilderWithoutAuth(harness)
 				.post('/stripe/webhook')
-				.header('stripe-signature', signWebhook(payload, 'whsec_test_fluxer'))
+				.header('stripe-signature', signStripeWebhook(payload, Math.floor(Date.now() / 1000), 'whsec_test_fluxer'))
 				.header('content-type', 'application/json')
 				.body(payload)
 				.executeRaw();
@@ -427,9 +442,7 @@ describe('hosted premium routes', () => {
 	test('keeps every Stripe and gift route registered regardless of premium mode', async () => {
 		setCachedInstancePremiumMode('everyone');
 		const account = await createTestAccount(harness);
-		const routes = [...BILLING_ROUTES, ...GIFT_ROUTES, ...HOSTED_ONLY_ROUTES, ...STORE_BILLING_ROUTES].filter(
-			([, path]) => path !== '/users/@me/age-verification',
-		);
+		const routes = [...BILLING_ROUTES, ...GIFT_ROUTES, ...HOSTED_ONLY_ROUTES, ...STORE_BILLING_ROUTES];
 		for (const [method, path] of routes) {
 			const result = await readRouteStatus(harness, account.token, method, path);
 			expect({path, code: result.code}).not.toEqual({path, code: APIErrorCodes.NOT_FOUND});

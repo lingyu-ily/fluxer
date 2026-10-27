@@ -8,32 +8,20 @@ export const MiscRateLimitConfigs = {
 		bucket: 'instance:info',
 		config: {limit: 60, windowMs: ms('1 minute')},
 	} as RouteRateLimitConfig,
-	IP_GEO_LOOKUP: {
-		bucket: 'ip:geo_lookup',
-		config: {limit: 30, windowMs: ms('1 minute')},
-	} as RouteRateLimitConfig,
-	DOWNLOAD_DESKTOP_LATEST: {
-		bucket: 'download:desktop:latest',
+	ACTIVITY_PUB_DOCUMENT: {
+		bucket: 'activity_pub:document',
 		config: {limit: 60, windowMs: ms('1 minute')},
 	} as RouteRateLimitConfig,
-	DOWNLOAD_DESKTOP_METADATA: {
-		bucket: 'download:desktop:metadata',
-		config: {limit: 120, windowMs: ms('1 minute')},
+	INSTANCE_SETUP_ACCOUNT_IDENTITY: {
+		bucket: 'instance:setup:account_identity',
+		config: {limit: 10, windowMs: ms('1 minute')},
 	} as RouteRateLimitConfig,
-	DOWNLOAD_ARTIFACT: {
-		bucket: 'download:artifact',
-		config: {limit: 5, windowMs: ms('1 minute')},
+	INSTANCE_SETUP_TOKEN_CHECK: {
+		bucket: 'instance:setup:token_check',
+		config: {limit: 10, windowMs: ms('1 minute')},
 	} as RouteRateLimitConfig,
-	DOWNLOAD_PACKAGE: {
-		bucket: 'download:package',
-		config: {limit: 5, windowMs: ms('1 minute')},
-	} as RouteRateLimitConfig,
-	DOWNLOAD_STORE_REDIRECT: {
-		bucket: 'download:store:redirect',
-		config: {limit: 30, windowMs: ms('1 minute')},
-	} as RouteRateLimitConfig,
-	DOWNLOAD_MODULE: {
-		bucket: 'download:module',
+	IP_GEO_LOOKUP: {
+		bucket: 'ip:geo_lookup',
 		config: {limit: 30, windowMs: ms('1 minute')},
 	} as RouteRateLimitConfig,
 	READ_STATE_ACK_BULK: {

@@ -3,10 +3,14 @@
 import type {AttachmentID, ChannelID} from '@app/api/BrandedTypes';
 import type {AttachmentRequestData} from '@app/api/channel/AttachmentDTOs';
 import type {RichEmbedMediaWithMetadata} from '@app/api/channel/EmbedTypes';
-import {getContentType, makeAttachmentCdnUrl} from '@app/api/channel/services/message/MessageHelpers';
+import {
+	EMBED_MEDIA_OWNED_ATTACHMENT_FLAG,
+	makeAttachmentCdnUrl,
+} from '@app/api/channel/services/message/MessageHelpers';
 import {ValidationErrorCodes} from '@fluxer/constants/src/ValidationErrorCodes';
 import {InputValidationError} from '@fluxer/errors/src/domains/core/InputValidationError';
 import type {RichEmbedRequest} from '@fluxer/schema/src/domains/message/MessageRequestSchemas';
+import {getContentTypeFromFilename} from '@pkgs/mime_utils/src/ContentTypeUtils';
 
 interface ProcessedAttachment {
 	attachment_id: AttachmentID;
@@ -72,7 +76,7 @@ export class MessageEmbedAttachmentResolver {
 					{filename},
 				);
 			}
-			if (!isEmbeddableMediaType(getContentType(filename))) {
+			if (!isEmbeddableMediaType(getContentTypeFromFilename(filename))) {
 				throw InputValidationError.fromCode(
 					`embeds[${embedIndex}].${field}`,
 					ValidationErrorCodes.ATTACHMENT_MUST_BE_IMAGE,
@@ -158,7 +162,7 @@ export class MessageEmbedAttachmentResolver {
 						content_type: metadata.content_type,
 						content_hash: metadata.content_hash,
 						placeholder: metadata.placeholder,
-						flags: metadata.flags,
+						flags: metadata.flags | EMBED_MEDIA_OWNED_ATTACHMENT_FLAG,
 						duration: metadata.duration,
 						nsfw: metadata.nsfw,
 					},
@@ -176,7 +180,7 @@ export class MessageEmbedAttachmentResolver {
 						content_type: metadata.content_type,
 						content_hash: metadata.content_hash,
 						placeholder: metadata.placeholder,
-						flags: metadata.flags,
+						flags: metadata.flags | EMBED_MEDIA_OWNED_ATTACHMENT_FLAG,
 						duration: metadata.duration,
 						nsfw: metadata.nsfw,
 					},

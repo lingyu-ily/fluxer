@@ -16,9 +16,11 @@ start(_StartType, _StartArgs) ->
 -spec init_subsystems() -> ok.
 init_subsystems() ->
     _ = fluxer_gateway_env:load(),
+    ok = gateway_guild_pin_keeper:apply_boot_pins(),
     gateway_compress:init(),
     gateway_cluster_metrics:init(),
     process_registry:init(),
+    guild_thread_store:init(),
     passive_sync_registry:init(),
     ok.
 
@@ -44,7 +46,6 @@ start_cowboy() ->
             },
             #{
                 env => #{dispatch => Dispatch},
-                max_frame_size => 4096,
                 connection_type => supervisor,
                 dynamic_buffer => {512, 131072}
             }
@@ -56,6 +57,7 @@ start_cowboy() ->
 
 -spec prep_stop(term()) -> term().
 prep_stop(State) ->
+    ok = gateway_shutdown_drain:run(),
     State.
 
 -spec stop(term()) -> ok.

@@ -2,11 +2,14 @@
 
 import {createAttachmentID, createChannelID, createMessageID, createUserID} from '@app/api/BrandedTypes';
 import {Config} from '@app/api/Config';
-import {purgeMessageAttachments} from '@app/api/channel/services/message/MessageHelpers';
+import {
+	EMBED_MEDIA_OWNED_ATTACHMENT_FLAG,
+	purgeMessageAttachments,
+} from '@app/api/channel/services/message/MessageHelpers';
 import type {MessageEmbed} from '@app/api/database/types/MessageTypes';
 import type {IPurgeQueue} from '@app/api/infrastructure/CachePurgeQueue';
-import type {IStorageService} from '@app/api/infrastructure/IStorageService';
 import {Message} from '@app/api/models/Message';
+import {MockStorageService} from '@app/api/test/mocks/MockStorageService';
 import {MessageTypes} from '@fluxer/constants/src/ChannelConstants';
 import {describe, expect, it} from 'vitest';
 
@@ -14,7 +17,7 @@ const CHANNEL_ID = createChannelID(10n);
 const ATTACHMENT_KEY = 'attachments/10/200/ação.png';
 const OTHER_MESSAGE_ATTACHMENT_KEY = 'attachments/11/300/photo.jpg';
 
-function imageEmbed(key: string): MessageEmbed {
+function imageEmbed(key: string, flags = 0): MessageEmbed {
 	return {
 		type: 'image',
 		title: null,
@@ -33,7 +36,7 @@ function imageEmbed(key: string): MessageEmbed {
 			content_type: 'image/png',
 			content_hash: null,
 			placeholder: null,
-			flags: 0,
+			flags,
 			duration: null,
 		},
 		video: null,
@@ -43,7 +46,9 @@ function imageEmbed(key: string): MessageEmbed {
 	};
 }
 
-function makeMessageWithMedia(): Message {
+function makeMessageWithMedia(
+	embeds: Array<MessageEmbed> = [imageEmbed(ATTACHMENT_KEY), imageEmbed(OTHER_MESSAGE_ATTACHMENT_KEY)],
+): Message {
 	return new Message({
 		channel_id: CHANNEL_ID,
 		bucket: 0,
@@ -79,7 +84,7 @@ function makeMessageWithMedia(): Message {
 				waveform: null,
 			},
 		],
-		embeds: [imageEmbed(ATTACHMENT_KEY), imageEmbed(OTHER_MESSAGE_ATTACHMENT_KEY)],
+		embeds,
 		sticker_items: null,
 		message_reference: null,
 		message_snapshots: null,
@@ -91,13 +96,8 @@ function makeMessageWithMedia(): Message {
 
 describe('purgeMessageAttachments', () => {
 	it('queues each stored media URL of a deleted message once and leaves media of other messages alone', async () => {
-		const deletedObjects: Array<string> = [];
 		const queuedUrls: Array<string> = [];
-		const storageService = {
-			deleteObject: async (bucket: string, key: string) => {
-				deletedObjects.push(`${bucket}/${key}`);
-			},
-		} as unknown as IStorageService;
+		const storageService = new MockStorageService();
 		const purgeQueue: IPurgeQueue = {
 			addUrls: async (urls) => {
 				queuedUrls.push(...urls);
@@ -106,7 +106,25 @@ describe('purgeMessageAttachments', () => {
 
 		await purgeMessageAttachments(makeMessageWithMedia(), storageService, purgeQueue);
 
-		expect(deletedObjects).toEqual([`${Config.s3.buckets.cdn}/${ATTACHMENT_KEY}`]);
+		expect(storageService.getDeletedObjects()).toEqual([{bucket: Config.s3.buckets.cdn, key: ATTACHMENT_KEY}]);
 		expect(queuedUrls).toEqual([`${Config.endpoints.media}/${ATTACHMENT_KEY}`]);
+	});
+
+	it('purges embed files the message owns and leaves marked files under other channels alone', async () => {
+		const storageService = new MockStorageService();
+		const purgeQueue: IPurgeQueue = {addUrls: async () => {}};
+		const ownedEmbedKey = 'attachments/10/201/embed.png';
+
+		await purgeMessageAttachments(
+			makeMessageWithMedia([
+				imageEmbed(ownedEmbedKey, EMBED_MEDIA_OWNED_ATTACHMENT_FLAG),
+				imageEmbed(OTHER_MESSAGE_ATTACHMENT_KEY, EMBED_MEDIA_OWNED_ATTACHMENT_FLAG),
+				imageEmbed('attachments/10/202/unmarked.png'),
+			]),
+			storageService,
+			purgeQueue,
+		);
+
+		expect(storageService.getDeletedObjects().map((object) => object.key)).toEqual([ATTACHMENT_KEY, ownedEmbedKey]);
 	});
 });

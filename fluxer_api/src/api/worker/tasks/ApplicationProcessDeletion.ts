@@ -4,7 +4,6 @@ import {applicationIdToUserId, createApplicationID, type GuildID} from '@app/api
 import {mapGuildMemberToResponse} from '@app/api/guild/GuildModel';
 import {Logger} from '@app/api/Logger';
 import {createRequestCache} from '@app/api/middleware/RequestCacheMiddleware';
-import {remapAuthorMessagesToDeletedUser} from '@app/api/oauth/ApplicationMessageAuthorAnonymization';
 import {chunkArray} from '@app/api/utils/ArrayUtils';
 import {getWorkerDependencies} from '@app/api/worker/WorkerContext';
 import {
@@ -25,15 +24,8 @@ const applicationProcessDeletion: WorkerTaskHandler = async (payload, helpers) =
 	helpers.logger.debug({payload: validated}, 'Processing applicationProcessDeletion task');
 	const applicationId = createApplicationID(BigInt(validated.applicationId));
 	const botUserId = applicationIdToUserId(applicationId);
-	const {
-		userRepository,
-		guildRepository,
-		channelRepository,
-		applicationRepository,
-		userCacheService,
-		gatewayService,
-		snowflakeService,
-	} = getWorkerDependencies();
+	const {userRepository, guildRepository, applicationRepository, userCacheService, gatewayService} =
+		getWorkerDependencies();
 	Logger.debug({applicationId, botUserId}, 'Starting application deletion');
 	try {
 		const application = await applicationRepository.getApplication(applicationId);
@@ -42,34 +34,27 @@ const applicationProcessDeletion: WorkerTaskHandler = async (payload, helpers) =
 			return;
 		}
 		const botUser = await userRepository.findUniqueAssert(botUserId);
-		const replacementAuthorId = await remapAuthorMessagesToDeletedUser({
-			originalAuthorId: botUserId,
-			channelRepository,
-			userRepository,
-			snowflakeService,
-		});
 		if (botUser.flags & UserFlags.DELETED) {
-			Logger.info(
-				{
-					applicationId,
-					botUserId,
-					replacementAuthorId: replacementAuthorId?.toString() ?? null,
-				},
-				'Bot user already marked as deleted, skipping profile update',
-			);
+			Logger.info({applicationId, botUserId}, 'Bot user already marked as deleted, skipping profile update');
 			await applicationRepository.deleteApplication(applicationId);
 			return;
 		}
-		const updatedBotUser = await userRepository.patchUpsert(
+		const renamedBotUser = await userRepository.patchUpsert(
 			botUserId,
 			{
 				username: DELETED_USER_USERNAME,
 				global_name: DELETED_USER_GLOBAL_NAME,
 				discriminator: DELETED_USER_DISCRIMINATOR,
-				flags: botUser.flags | UserFlags.DELETED,
+				avatar_hash: null,
+				banner_hash: null,
+				bio: null,
+				pronouns: null,
+				accent_color: null,
 			},
 			botUser.toRow(),
 		);
+		const updatedBotUser =
+			(await userRepository.updateFlags(botUserId, (flags) => flags | UserFlags.DELETED)) ?? renamedBotUser;
 		await userCacheService.setUserPartialResponseFromUser(updatedBotUser);
 		Logger.debug({applicationId, botUserId}, 'Updated bot user to deleted state');
 		const guildIds = await userRepository.getUserGuildIds(botUserId);

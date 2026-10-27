@@ -19,6 +19,8 @@ import {Store} from '@app/features/voice/engine/Store';
 import VoiceDevicePermissionState from '@app/features/voice/engine/VoiceDevicePermissionState';
 import type {EffectiveAudioState} from '@app/features/voice/engine/VoiceEffectiveAudioState';
 import {getEffectiveAudioState} from '@app/features/voice/engine/VoiceEffectiveAudioState';
+import {noteLocalVoiceActivity} from '@app/features/voice/engine/VoiceIdleActivityBridge';
+import {acquireVoiceInputContext, type VoiceInputContextLease} from '@app/features/voice/engine/VoiceInputAudioContext';
 import {
 	createVoiceMicrophoneFailureLatchSnapshot,
 	isVoiceMicrophoneFailureLatchActive,
@@ -27,7 +29,7 @@ import {
 	transitionVoiceMicrophoneFailureLatchSnapshot,
 	type VoiceMicrophoneFailureLatchEvent,
 } from '@app/features/voice/engine/VoiceLocalAudioReconcilePolicy';
-import {resolveLocalSpeakingOverrideState} from '@app/features/voice/engine/VoiceLocalSpeakingGate';
+import {isLocalSpeakingSuppressed} from '@app/features/voice/engine/VoiceLocalSpeakingGate';
 import {
 	getRoomFromMediaEngine,
 	getVoiceConnectionContextFromMediaEngine,
@@ -42,10 +44,7 @@ import {
 	type VoiceMediaEvent,
 	type VoiceMediaSnapshot,
 } from '@app/features/voice/engine/VoiceMediaStateMachine';
-import {
-	getLocalSpeakingThresholdRms,
-	SPEAKING_LOCAL_RELEASE_MS,
-} from '@app/features/voice/engine/VoiceSpeakingThreshold';
+import {VoiceSpeakingMeter} from '@app/features/voice/engine/VoiceSpeakingDetection';
 import type {VoiceStateSyncPartial} from '@app/features/voice/engine/VoiceStateSyncTypes';
 import {
 	enforceLocalMediaPublicationCap,
@@ -73,17 +72,9 @@ import {
 	type VoiceEngineV2AppCameraTransitionOutcome,
 } from '@app/features/voice/engine/v2/VoiceEngineV2AppCameraTransition';
 import {
-	chooseMicrophoneRefreshStrategy,
-	computeSpeakingDetectorRms,
 	createInitialMicrophoneEnableState,
-	createInitialMicrophoneRefreshState,
 	type MicrophoneEnableContext,
 	type MicrophoneEnableState,
-	type MicrophoneRefreshContext,
-	type MicrophoneRefreshState,
-	readSpeakingDetectorThresholdRms,
-	type SpeakingDetectorGraph,
-	type SpeakingDetectorTickOptions,
 } from '@app/features/voice/engine/v2/VoiceEngineV2AppMicrophoneTransaction';
 import {
 	selectVoiceEngineV2AppEffectiveSelfMuteFromAudioControls,
@@ -103,12 +94,11 @@ import {
 	buildCameraPublishOptions,
 	findVideoPublishCodecPolicyViolation,
 } from '@app/features/voice/utils/CodecCapabilityDetector';
+import {awaitMicrophoneSessionWarmup} from '@app/features/voice/utils/noise_suppression/DeepFilter';
+import NoiseSuppressionAvailability from '@app/features/voice/utils/noise_suppression/NoiseSuppressionAvailability';
+import {readCaptureNoiseSuppressionBackend} from '@app/features/voice/utils/noise_suppression/NoiseSuppressionRuntime';
 import {applyBackgroundProcessor, clearCameraVideoProcessor} from '@app/features/voice/utils/VideoBackgroundProcessor';
-import {
-	removeVoiceInputProcessor,
-	syncVoiceInputProcessor,
-	updateVoiceInputGain,
-} from '@app/features/voice/utils/VoiceInputProcessor';
+import {readVoiceInputProcessor, VoiceInputTrackProcessor} from '@app/features/voice/utils/VoiceInputProcessor';
 import {
 	isVoicePermissionMuteActive,
 	isVoiceSpeakPermissionDenied,
@@ -125,7 +115,7 @@ import type {
 	VoiceEngineV2AudioMode,
 	VoiceEngineV2CameraEncodingOptions,
 	VoiceEngineV2MicrophoneOptions,
-} from '@fluxer/voice_engine_v2';
+} from '@fluxer/voice_engine_v2/src/protocol/types';
 import type {
 	AudioCaptureOptions,
 	LocalAudioTrack,
@@ -135,21 +125,42 @@ import type {
 	TrackPublishOptions,
 	VideoCaptureOptions,
 } from 'livekit-client';
-import {Track} from 'livekit-client';
+import {Track, TrackEvent} from 'livekit-client';
 
 const logger = new Logger('VoiceEngineV2AppMediaExecutionAdapter');
-const LOCAL_SPEAKING_ANALYSER_INTERVAL_MS = 50;
 const CAMERA_PUBLISH_CODEC_CORRECTION_MAX = 1;
-export const REPUBLISH_MICROPHONE_GUARD_MS = 150;
+const REPUBLISH_MICROPHONE_GUARD_MS = 150;
 type VoiceMuteReason = VoiceEngineV2AppVoiceMuteReason;
 
-export interface SetCameraEnabledOptions {
+interface SetCameraEnabledOptions {
 	deviceId?: string;
 	sendUpdate?: boolean;
 }
 
-export interface RefreshMicrophoneOptions {
-	forceRepublish?: boolean;
+interface MicrophoneRefreshRequest {
+	republish: boolean;
+}
+
+interface QueuedMicrophoneRefresh {
+	republish: boolean;
+	promise: Promise<void>;
+}
+
+function readConstraintValue<T>(constraint: T | {exact?: T; ideal?: T} | undefined): T | undefined {
+	if (constraint !== null && typeof constraint === 'object' && !Array.isArray(constraint)) {
+		const range = constraint as {exact?: T; ideal?: T};
+		return range.exact ?? range.ideal;
+	}
+	return constraint as T | undefined;
+}
+
+function microphoneCaptureMatches(constraints: MediaTrackConstraints, options: AudioCaptureOptions): boolean {
+	return (
+		readConstraintValue(constraints.deviceId) === readConstraintValue(options.deviceId) &&
+		readConstraintValue(constraints.echoCancellation) === readConstraintValue(options.echoCancellation) &&
+		readConstraintValue(constraints.noiseSuppression) === readConstraintValue(options.noiseSuppression) &&
+		readConstraintValue(constraints.autoGainControl) === readConstraintValue(options.autoGainControl)
+	);
 }
 
 function extractUserIdFromVoiceIdentity(identity: string): string | null {
@@ -188,7 +199,7 @@ function applyMicrophoneFailureLatchEvent(event: VoiceMicrophoneFailureLatchEven
 	return true;
 }
 
-export function isMicrophoneEnableFailureLatched(): boolean {
+function isMicrophoneEnableFailureLatched(): boolean {
 	return isVoiceMicrophoneFailureLatchActive(microphoneFailureLatchSnapshot);
 }
 
@@ -220,16 +231,16 @@ function getEffectiveSelfMuteForVoiceStatePayloadFromV2AudioControls(): boolean 
 	return selectVoiceEngineV2AppEffectiveSelfMuteFromAudioControls(getVoiceEngineV2AudioControlsFromAppState());
 }
 
-export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
-	private speakingAudioContext: AudioContext | null = null;
-	private speakingSourceNode: MediaStreamAudioSourceNode | null = null;
-	private speakingAnalyserNode: AnalyserNode | null = null;
-	private speakingTimerId: number | null = null;
-	private speakingSilenceStartedAt: number | null = null;
-	private speakingTrackEndedCleanup: (() => void) | null = null;
+class VoiceEngineV2AppMediaExecutionAdapter extends Store {
+	private speakingDetectorCleanup: (() => void) | null = null;
+	private localSpeakingMeter: VoiceSpeakingMeter | null = null;
 	private mediaStateSnapshot: VoiceMediaSnapshot = createVoiceMediaSnapshot();
 	private microphoneEnablePromise: Promise<void> | null = null;
+	private microphoneEnableRoom: Room | null = null;
+	private microphoneEnableGeneration = 0;
 	private microphoneRefreshQueue: Promise<void> = Promise.resolve();
+	private queuedMicrophoneRefresh: QueuedMicrophoneRefresh | null = null;
+	private voiceInputRecovery: {lease: VoiceInputContextLease; cleanup: () => void} | null = null;
 	private cameraBackgroundRefreshQueue: Promise<void> = Promise.resolve();
 	private cameraCaptureRefreshQueue: Promise<void> = Promise.resolve();
 	private sourceLifecycleBridge: VoiceEngineV2AppSourceLifecycleBridge | null = null;
@@ -328,6 +339,12 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		return isVoiceSpeakPermissionDenied(connection?.guildId ?? null, channelId);
 	}
 
+	private isMicrophoneHeldByVoiceState(channelId: string | null): boolean {
+		if (this.isSpeakPermissionDenied(channelId)) return false;
+		const audioState = this.getEffectiveAudioState();
+		return audioState.serverMute || audioState.serverDeaf;
+	}
+
 	private transitionMediaState(event: VoiceMediaEvent): void {
 		this.update(() => {
 			const nextSnapshot = transitionVoiceMediaSnapshot(this.mediaStateSnapshot, event);
@@ -361,7 +378,7 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 	private async enforceSpeakPermissionMute(room: Room): Promise<void> {
 		await this.disableMicrophone(room);
 		this.syncVoiceState({self_mute: true});
-		this.syncLocalSpeakingOverride(room);
+		this.syncLocalSpeaking(room);
 	}
 
 	async prepareMicrophonePermissionForConnect(): Promise<boolean> {
@@ -473,10 +490,12 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 			} else {
 				this.syncVoiceState({self_mute: audioState.selfMute});
 			}
-			this.syncLocalSpeakingOverride(room);
+			this.syncLocalSpeaking(room);
 		} catch (e: unknown) {
 			if (isPermissionDeniedError(e)) {
 				this.handleMicrophonePermissionDenied();
+				this.syncVoiceState({self_mute: true});
+			} else if (isMicrophoneEnableFailureLatched()) {
 				this.syncVoiceState({self_mute: true});
 			}
 		}
@@ -528,17 +547,9 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 			await this.enforceSpeakPermissionMute(room);
 			return;
 		}
-		const pttActive = isPushToTalkActiveFromAppState();
-		const ptmActive = isPushToMuteActiveFromAppState();
-		const effectiveMute =
-			audioState.effectiveDeaf ||
-			audioState.serverMute ||
-			audioState.selfMute ||
-			(pttActive && !Keybind.pushToTalkHeld) ||
-			(ptmActive && Keybind.pushToMuteHeld);
-		if (effectiveMute) {
+		if (audioState.effectiveDeaf || audioState.serverMute || audioState.selfMute) {
 			this.setAudioPublicationsMuted(room, true, 'voice state update');
-			this.syncLocalSpeakingOverride(room);
+			this.syncLocalSpeaking(room);
 			return;
 		}
 		if (!this.hasLiveMicrophonePublication(room)) {
@@ -557,8 +568,8 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 				return;
 			}
 		}
-		this.setAudioPublicationsMuted(room, false, 'voice state update');
-		this.syncLocalSpeakingOverride(room);
+		this.setAudioPublicationsMuted(room, this.shouldMuteMicrophonePublication(), 'voice state update');
+		this.syncLocalSpeaking(room);
 	}
 
 	private hasMicrophonePublication(room: Room): boolean {
@@ -664,131 +675,180 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		}
 	}
 
-	async refreshMicrophone(room: Room | null, options: RefreshMicrophoneOptions = {}): Promise<void> {
-		assertNullableObjectLike<Room>(room, 'refreshMicrophone.room');
-		assertObjectLike<RefreshMicrophoneOptions>(options, 'refreshMicrophone.options');
+	requestMicrophoneRefresh(room: Room | null, request: MicrophoneRefreshRequest): Promise<void> {
+		assertNullableObjectLike<Room>(room, 'requestMicrophoneRefresh.room');
+		assertObjectLike<MicrophoneRefreshRequest>(request, 'requestMicrophoneRefresh.request');
 		this.observeMicrophoneFailureLatchScope(this.getActiveChannelId());
-		const refresh = async () => this.refreshMicrophoneNow(room, options);
-		const pendingRefresh = this.microphoneRefreshQueue.then(refresh, refresh);
-		this.microphoneRefreshQueue = pendingRefresh.catch(() => {});
-		return pendingRefresh;
+		const queued = this.queuedMicrophoneRefresh;
+		if (queued) {
+			queued.republish ||= request.republish;
+			return queued.promise;
+		}
+		const next: QueuedMicrophoneRefresh = {republish: request.republish, promise: Promise.resolve()};
+		next.promise = this.microphoneRefreshQueue.then(() => {
+			if (this.queuedMicrophoneRefresh === next) this.queuedMicrophoneRefresh = null;
+			return this.runMicrophoneRefresh(room, next.republish);
+		});
+		this.queuedMicrophoneRefresh = next;
+		this.microphoneRefreshQueue = next.promise.catch(() => {});
+		return next.promise;
 	}
 
-	private async refreshMicrophoneNow(room: Room | null, options: RefreshMicrophoneOptions = {}): Promise<void> {
+	private async runMicrophoneRefresh(room: Room | null, republish: boolean): Promise<void> {
+		await this.microphoneEnablePromise?.catch(() => {});
 		if (!room?.localParticipant || !this.hasMicrophonePublication(room)) {
 			return;
 		}
-		this.transitionMediaState({
-			type: 'refresh.request',
-			hasPublication: true,
-			forceRepublish: options.forceRepublish,
-		});
+		this.transitionMediaState({type: 'refresh.request', hasPublication: true, forceRepublish: republish});
 		const audioTrack = this.getLocalAudioTrack(room);
 		if (!audioTrack) {
 			return;
 		}
+		if (republish) {
+			await this.republishMicrophoneAfterSettingsChange(room);
+			return;
+		}
+		const processor = readVoiceInputProcessor(audioTrack);
+		const browserNoiseSuppressionTurnsOff =
+			readConstraintValue(audioTrack.constraints.noiseSuppression) === true &&
+			this.getMicrophoneCaptureOptions().noiseSuppression === false;
+		if (browserNoiseSuppressionTurnsOff) {
+			await processor?.configure();
+		}
 		const captureOptions = this.getMicrophoneCaptureOptions();
-		const strategy = chooseMicrophoneRefreshStrategy(options);
-		if (strategy === 'force-republish') {
-			await this.attemptMicrophoneForceRepublish(room, captureOptions);
-			return;
+		if (!microphoneCaptureMatches(audioTrack.constraints, captureOptions)) {
+			try {
+				await audioTrack.restartTrack(captureOptions);
+				this.transitionMediaState({type: 'refresh.restart.success'});
+				logger.debug('Restarted microphone capture with new settings', {captureOptions});
+			} catch (error) {
+				this.transitionMediaState({type: 'refresh.restart.failure'});
+				logger.warn('Failed to restart microphone capture; re-publishing mic from scratch', {error, captureOptions});
+				await this.republishMicrophoneAfterSettingsChange(room);
+				return;
+			}
 		}
-		const ctx: MicrophoneRefreshContext = {room, options, audioTrack, captureOptions};
-		const state: MicrophoneRefreshState = createInitialMicrophoneRefreshState();
-		await this.prepareMicrophoneRefreshHold(ctx, state);
-		try {
-			await this.restartActiveMicrophoneTrack(ctx, state);
-		} catch (error) {
-			this.transitionMediaState({type: 'refresh.restart.failure'});
-			logger.warn('Failed to restart microphone capture; re-publishing mic from scratch', {
-				error,
-				captureOptions,
-			});
-		}
-		if (state.restartSucceeded) {
-			await this.releaseMicrophoneRefreshHold(state);
-			return;
-		}
-		await this.republishMicrophoneAfterRestartFailure(room);
+		await this.refreshMicrophonePublishSettings(room, this.getActiveChannelId());
+		this.applyMicrophoneContentHint(audioTrack);
+		await processor?.configure();
+		if (processor) processor.reportRuntime();
+		else this.reportRawMicrophoneRuntime(audioTrack);
 	}
 
-	private async attemptMicrophoneForceRepublish(room: Room, captureOptions: AudioCaptureOptions): Promise<void> {
-		assertObjectLike<Room>(room, 'attemptMicrophoneForceRepublish.room');
-		assertObjectLike<AudioCaptureOptions>(captureOptions, 'attemptMicrophoneForceRepublish.captureOptions');
+	private reportRawMicrophoneRuntime(track: LocalAudioTrack): void {
+		const rawTrack = track.mediaStreamTrack;
+		NoiseSuppressionAvailability.setVoiceInputRuntime(
+			track,
+			readCaptureNoiseSuppressionBackend(rawTrack),
+			rawTrack.getSettings(),
+			null,
+		);
+	}
+
+	private applyMicrophoneContentHint(audioTrack: LocalAudioTrack): void {
+		const profile = resolveVoiceProcessingFromStateForDeviceLabel(VoiceSettings, this.resolveActiveInputDeviceLabel());
+		if (audioTrack.mediaStreamTrack) {
+			applyContentHintToTrack(audioTrack.mediaStreamTrack, profile.contentHint);
+		}
+	}
+
+	private async republishMicrophoneAfterSettingsChange(room: Room): Promise<void> {
+		assertObjectLike<Room>(room, 'republishMicrophoneAfterSettingsChange.room');
 		try {
 			await this.republishMicrophone(room);
 			this.transitionMediaState({type: 'refresh.republish.success'});
-			logger.debug('Re-published microphone capture settings', {captureOptions});
 		} catch (recoveryError) {
 			this.transitionMediaState({type: 'refresh.republish.failure'});
-			logger.error('Failed to re-publish microphone after capture settings change', recoveryError);
+			logger.error('Failed to re-publish microphone', recoveryError);
 		}
 	}
 
-	private async prepareMicrophoneRefreshHold(
-		ctx: MicrophoneRefreshContext,
-		state: MicrophoneRefreshState,
-	): Promise<void> {
-		assertObjectLike<MicrophoneRefreshContext>(ctx, 'prepareMicrophoneRefreshHold.ctx');
-		assertObjectLike<MicrophoneRefreshState>(state, 'prepareMicrophoneRefreshHold.state');
-		const primaryMicPublication =
-			Array.from(ctx.room.localParticipant.audioTrackPublications.values()).find(
-				(pub) => pub.track === ctx.audioTrack,
-			) ?? null;
-		state.primaryMicPublication = primaryMicPublication;
-		state.shouldUnmuteAfter = primaryMicPublication ? !primaryMicPublication.isMuted : false;
-		if (state.shouldUnmuteAfter) {
-			await primaryMicPublication?.mute().catch((muteError) => {
-				logger.warn('Failed to hold mic muted while refreshing voice input processor', {muteError});
-			});
+	configureVoiceInput(room: Room | null): void {
+		assertNullableObjectLike<Room>(room, 'configureVoiceInput.room');
+		if (!room?.localParticipant) return;
+		if (this.voiceInputRecovery?.lease.context.state === 'running') {
+			void this.reinstallVoiceInputProcessor(room);
 		}
+		void readVoiceInputProcessor(this.getLocalAudioTrack(room))?.configure();
 	}
 
-	private async restartActiveMicrophoneTrack(
-		ctx: MicrophoneRefreshContext,
-		state: MicrophoneRefreshState,
-	): Promise<void> {
-		assertObjectLike<MicrophoneRefreshContext>(ctx, 'restartActiveMicrophoneTrack.ctx');
-		assertObjectLike<MicrophoneRefreshState>(state, 'restartActiveMicrophoneTrack.state');
-		await ctx.audioTrack.restartTrack(ctx.captureOptions);
-		await this.refreshMicrophonePublishSettings(ctx.room, this.getActiveChannelId());
-		await syncVoiceInputProcessor(ctx.audioTrack);
-		this.applyMicrophoneRefreshSnapshot(ctx);
-		state.restartSucceeded = true;
-		this.transitionMediaState({type: 'refresh.restart.success'});
-		logger.debug('Refreshed microphone capture settings');
-	}
-
-	private applyMicrophoneRefreshSnapshot(ctx: MicrophoneRefreshContext): void {
-		assertObjectLike<MicrophoneRefreshContext>(ctx, 'applyMicrophoneRefreshSnapshot.ctx');
-		assertObjectLike<LocalAudioTrack>(ctx.audioTrack, 'applyMicrophoneRefreshSnapshot.audioTrack');
-		const profile = resolveVoiceProcessingFromStateForDeviceLabel(VoiceSettings, this.resolveActiveInputDeviceLabel());
-		if (ctx.audioTrack.mediaStreamTrack) {
-			applyContentHintToTrack(ctx.audioTrack.mediaStreamTrack, profile.contentHint);
-		}
-		this.startLocalSpeakingDetector(ctx.room, ctx.audioTrack.mediaStreamTrack ?? null);
-	}
-
-	private async releaseMicrophoneRefreshHold(state: MicrophoneRefreshState): Promise<void> {
-		assertObjectLike<MicrophoneRefreshState>(state, 'releaseMicrophoneRefreshHold.state');
-		if (!state.shouldUnmuteAfter) return;
-		const selfMute = getEffectiveSelfMuteForVoiceStatePayloadFromV2AudioControls();
-		const selfDeaf = LocalVoiceState.getSelfDeaf();
-		if (selfMute || selfDeaf) return;
-		await state.primaryMicPublication?.unmute().catch((unmuteError) => {
-			logger.warn('Failed to resume mic after refreshing voice input processor', {unmuteError});
+	private createMicrophoneProcessor(room: Room, channelId: string | null): VoiceInputTrackProcessor {
+		const profile = this.resolveActiveMicrophoneProfile();
+		const stereo = sendsStereoMicrophone(this.resolveMicrophoneChannelBitrate(channelId), profile.stereoCapture);
+		return new VoiceInputTrackProcessor(stereo ? 2 : 1, {
+			onSourceRateChanged: () => {
+				void this.requestMicrophoneRefresh(room, {republish: true});
+			},
+			onGraphFailed: (processor) => {
+				NoiseSuppressionAvailability.setVoiceInputGraphUnavailable(true);
+				const removeProcessor = async (): Promise<void> => {
+					await this.microphoneEnablePromise?.catch(() => {});
+					const track = this.getLocalAudioTrack(room);
+					await track?.stopProcessorIfCurrent(processor);
+				};
+				void removeProcessor().catch((error) => {
+					logger.warn('Failed to remove the unavailable voice input processor', {error});
+				});
+			},
+			onGraphStalled: (processor) => {
+				logger.warn('Voice input AudioContext is not running; sending the microphone without processing');
+				NoiseSuppressionAvailability.setVoiceInputGraphUnavailable(true);
+				void (async () => {
+					await this.microphoneEnablePromise?.catch(() => {});
+					const track = this.getLocalAudioTrack(room);
+					if (await track?.stopProcessorIfCurrent(processor)) this.beginVoiceInputRecovery(room);
+				})().catch((error) => {
+					logger.warn('Failed to remove the stalled voice input processor', {error});
+				});
+			},
 		});
 	}
 
-	private async republishMicrophoneAfterRestartFailure(room: Room): Promise<void> {
-		assertObjectLike<Room>(room, 'republishMicrophoneAfterRestartFailure.room');
-		try {
-			await this.republishMicrophone(room);
-			this.transitionMediaState({type: 'refresh.republish.success'});
-		} catch (recoveryError) {
-			this.transitionMediaState({type: 'refresh.republish.failure'});
-			logger.error('Failed to recover microphone after restart failure', recoveryError);
-		}
+	private beginVoiceInputRecovery(room: Room): void {
+		NoiseSuppressionAvailability.setVoiceInputGraphUnavailable(true);
+		if (this.voiceInputRecovery) return;
+		const lease = acquireVoiceInputContext();
+		if (!lease) return;
+		const onStateChange = (): void => {
+			if (lease.context.state === 'running') void this.reinstallVoiceInputProcessor(room);
+		};
+		lease.context.addEventListener('statechange', onStateChange);
+		this.voiceInputRecovery = {
+			lease,
+			cleanup: () => {
+				lease.context.removeEventListener('statechange', onStateChange);
+				lease.release();
+			},
+		};
+		onStateChange();
+	}
+
+	private endVoiceInputRecovery(): void {
+		this.voiceInputRecovery?.cleanup();
+		this.voiceInputRecovery = null;
+		NoiseSuppressionAvailability.setVoiceInputGraphUnavailable(false);
+	}
+
+	private reinstallVoiceInputProcessor(room: Room): Promise<void> {
+		const reinstall = async (): Promise<void> => {
+			if (!this.voiceInputRecovery) return;
+			const audioTrack = this.getLocalAudioTrack(room);
+			if (!audioTrack) return;
+			if (readVoiceInputProcessor(audioTrack)) {
+				this.endVoiceInputRecovery();
+				return;
+			}
+			try {
+				await audioTrack.setProcessor(this.createMicrophoneProcessor(room, this.getActiveChannelId()));
+				this.endVoiceInputRecovery();
+				logger.info('Voice input processor reinstalled');
+			} catch (error) {
+				logger.warn('Voice input processor reinstall failed; the microphone stays unprocessed', {error});
+			}
+		};
+		const pending = this.microphoneRefreshQueue.then(reinstall);
+		this.microphoneRefreshQueue = pending.catch(() => {});
+		return pending;
 	}
 
 	private async republishMicrophone(room: Room): Promise<void> {
@@ -821,7 +881,7 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		assertObjectLike<Room>(room, 'enableMicrophone.room');
 		assertOptionalNonEmptyString(channelId, 'enableMicrophone.channelId');
 		assertObjectLike<VoiceEngineV2MicrophoneOptions>(options, 'enableMicrophone.options');
-		if (this.microphoneEnablePromise) {
+		if (this.microphoneEnablePromise && this.microphoneEnableRoom === room) {
 			await this.microphoneEnablePromise;
 			if (this.hasLiveMicrophonePublication(room) || this.microphoneEnablePromise !== null) {
 				return;
@@ -830,11 +890,16 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 				channelId,
 			});
 		}
-		this.microphoneEnablePromise = this.enableMicrophoneNow(room, channelId, options);
+		const enable = this.enableMicrophoneNow(room, channelId, options);
+		this.microphoneEnablePromise = enable;
+		this.microphoneEnableRoom = room;
 		try {
-			await this.microphoneEnablePromise;
+			await enable;
 		} finally {
-			this.microphoneEnablePromise = null;
+			if (this.microphoneEnablePromise === enable) {
+				this.microphoneEnablePromise = null;
+				this.microphoneEnableRoom = null;
+			}
 		}
 	}
 
@@ -843,6 +908,10 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		channelId: string | null,
 		options: VoiceEngineV2MicrophoneOptions,
 	): Promise<void> {
+		if (this.isMicrophoneHeldByVoiceState(channelId)) {
+			logger.debug('Skipping microphone enable: muted or deafened by the server');
+			return;
+		}
 		this.transitionMediaState({
 			type: 'microphone.enable.request',
 			hasPublication: this.hasMicrophonePublication(room),
@@ -866,6 +935,7 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		}
 		const ctx: MicrophoneEnableContext = {room, channelId, options};
 		const state: MicrophoneEnableState = createInitialMicrophoneEnableState();
+		const generation = ++this.microphoneEnableGeneration;
 		try {
 			await this.acquireMicrophoneDevice(ctx, state);
 			if (!ctx.room.localParticipant) {
@@ -874,13 +944,16 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 				return;
 			}
 			await this.publishMicrophoneAudioTrack(ctx, state);
-			await this.installVoiceInputProcessor(ctx, state);
 			this.attachLocalSpeakingDetectorForPublish(ctx, state);
 			MediaPermission.updateMicrophonePermissionGranted();
 			this.transitionMediaState({type: 'microphone.enable.success'});
 			this.transitionMicrophoneFailureLatch({type: 'microphone.enableSucceeded'});
 			logger.info('Successfully enabled microphone');
 		} catch (e: unknown) {
+			if (generation !== this.microphoneEnableGeneration) {
+				logger.warn('Microphone enable for a replaced room failed', {channelId, error: e});
+				throw e;
+			}
 			this.transitionMicrophoneFailureLatch({
 				type: 'microphone.enableFailed',
 				channelId: ctx.channelId ?? this.getActiveChannelId(),
@@ -903,42 +976,43 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 	private async publishMicrophoneAudioTrack(ctx: MicrophoneEnableContext, state: MicrophoneEnableState): Promise<void> {
 		assertObjectLike<MicrophoneEnableContext>(ctx, 'publishMicrophoneAudioTrack.ctx');
 		assertObjectLike<MicrophoneEnableState>(state, 'publishMicrophoneAudioTrack.state');
-		await ctx.room.localParticipant.setMicrophoneEnabled(
-			true,
-			this.getMicrophoneCaptureOptions(ctx.options, ctx.channelId),
-			this.getMicrophonePublishOptions(ctx.channelId),
-		);
-		state.microphoneWasPublished = true;
-		await this.refreshMicrophonePublishSettings(ctx.room, ctx.channelId);
-		const audioTrack = this.getLocalAudioTrack(ctx.room);
-		state.audioTrack = audioTrack;
-		state.primaryMicPublication = audioTrack
-			? (Array.from(ctx.room.localParticipant.audioTrackPublications.values()).find(
-					(pub) => pub.track === audioTrack,
-				) ?? null)
-			: null;
-		state.shouldUnmuteAfter = state.primaryMicPublication ? !state.primaryMicPublication.isMuted : false;
-		this.bindMicrophoneLifecycle(state.audioTrack?.mediaStreamTrack);
+		await awaitMicrophoneSessionWarmup();
+		const tracks = await ctx.room.localParticipant.createTracks({
+			audio: {
+				...this.getMicrophoneCaptureOptions(ctx.options, ctx.channelId),
+				processor: this.createMicrophoneProcessor(ctx.room, ctx.channelId),
+			},
+		});
+		try {
+			for (const track of tracks) await track.mute();
+			for (const track of tracks) {
+				await ctx.room.localParticipant.publishTrack(track, this.getMicrophonePublishOptions(ctx.channelId));
+				state.microphoneWasPublished = true;
+			}
+			await this.refreshMicrophonePublishSettings(ctx.room, ctx.channelId);
+			const audioTrack = this.getLocalAudioTrack(ctx.room);
+			state.audioTrack = audioTrack;
+			if (audioTrack) {
+				let muted: boolean;
+				do {
+					muted = this.shouldMuteMicrophonePublication();
+					if (muted) await audioTrack.mute();
+					else await audioTrack.unmute();
+				} while (muted !== this.shouldMuteMicrophonePublication());
+				if (!readVoiceInputProcessor(audioTrack)) {
+					logger.warn('Voice input processor unavailable; publishing the raw mic track');
+					this.beginVoiceInputRecovery(ctx.room);
+				}
+			}
+			this.bindMicrophoneLifecycle(audioTrack?.mediaStream?.getAudioTracks()[0]);
+		} catch (error) {
+			for (const track of tracks) track.stop();
+			throw error;
+		}
 	}
 
-	private async installVoiceInputProcessor(ctx: MicrophoneEnableContext, state: MicrophoneEnableState): Promise<void> {
-		assertObjectLike<MicrophoneEnableContext>(ctx, 'installVoiceInputProcessor.ctx');
-		assertObjectLike<MicrophoneEnableState>(state, 'installVoiceInputProcessor.state');
-		if (state.primaryMicPublication && state.shouldUnmuteAfter) {
-			await state.primaryMicPublication.mute().catch((error) => {
-				logger.warn('Failed to hold mic muted while installing voice input processor', {error});
-			});
-		}
-		await syncVoiceInputProcessor(state.audioTrack);
-		if (state.primaryMicPublication && state.shouldUnmuteAfter) {
-			const selfMute = getEffectiveSelfMuteForVoiceStatePayloadFromV2AudioControls();
-			const selfDeaf = LocalVoiceState.getSelfDeaf();
-			if (!selfMute && !selfDeaf) {
-				await state.primaryMicPublication.unmute().catch((error) => {
-					logger.warn('Failed to resume mic after installing voice input processor', {error});
-				});
-			}
-		}
+	private shouldMuteMicrophonePublication(): boolean {
+		return getEffectiveSelfMuteForVoiceStatePayloadFromV2AudioControls() || this.getEffectiveAudioState().effectiveMute;
 	}
 
 	private attachLocalSpeakingDetectorForPublish(ctx: MicrophoneEnableContext, state: MicrophoneEnableState): void {
@@ -948,7 +1022,7 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		if (state.audioTrack?.mediaStreamTrack) {
 			applyContentHintToTrack(state.audioTrack.mediaStreamTrack, profile.contentHint);
 		}
-		this.startLocalSpeakingDetector(ctx.room, state.audioTrack?.mediaStreamTrack ?? null);
+		this.startLocalSpeakingDetector(ctx.room);
 	}
 
 	private async rollbackMicrophoneEnable(
@@ -995,12 +1069,12 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 				const tracks = microphonePublications
 					.map((pub) => pub.track)
 					.filter((track): track is LocalAudioTrack => Boolean(track));
-				await removeVoiceInputProcessor();
 				this.stopLocalSpeakingDetector(room);
 				await Promise.allSettled(tracks.map((track) => participant.unpublishTrack(track)));
 				logger.info('Successfully disabled microphone', {tracksUnpublished: tracks.length});
 			}
 			this.unbindMicrophoneLifecycle();
+			this.endVoiceInputRecovery();
 			this.transitionMediaState({type: 'microphone.disable.success'});
 		} catch (e) {
 			this.transitionMediaState({type: 'microphone.disable.failure'});
@@ -1051,7 +1125,6 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 			width: options.width,
 			height: options.height,
 			frameRate: options.frameRate,
-			mirror: options.mirror,
 			backgroundMode: options.backgroundMode,
 		});
 	}
@@ -1099,13 +1172,12 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		options: VoiceEngineV2CameraEncodingOptions,
 	): Promise<void> {
 		const touchesEffects =
-			options.mirror !== undefined ||
 			options.backgroundMode !== undefined ||
 			options.backgroundBlurStrength !== undefined ||
 			options.backgroundCustomMediaPath !== undefined;
 		if (!touchesEffects) return;
 		try {
-			await applyBackgroundProcessor(track, options.mirror === undefined ? undefined : {mirrorCamera: options.mirror});
+			await applyBackgroundProcessor(track);
 		} catch (error) {
 			logger.warn('Failed to apply in-place camera effects', {error});
 		}
@@ -1305,21 +1377,6 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		updateLocalParticipantFromRoom(activeRoom);
 	}
 
-	async toggleCameraFromKeybind(): Promise<void> {
-		assert.equal(
-			typeof LocalVoiceState.getSelfVideo,
-			'function',
-			'toggleCameraFromKeybind pre-condition: LocalVoiceState present',
-		);
-		assert.equal(
-			typeof VoiceSettings.getVideoDeviceId,
-			'function',
-			'toggleCameraFromKeybind pre-condition: VoiceSettings present',
-		);
-		const current = LocalVoiceState.getSelfVideo();
-		await this.setCameraEnabled(!current, {deviceId: VoiceSettings.getVideoDeviceId()});
-	}
-
 	async playEntranceSound(): Promise<void> {
 		assert.ok(this.mediaStateSnapshot !== null, 'playEntranceSound pre-condition: snapshot present');
 		const connection = getVoiceConnectionContextFromMediaEngine();
@@ -1348,8 +1405,8 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 
 	resetStreamTracking(): void {
 		assert.ok(this.mediaStateSnapshot !== null, 'resetStreamTracking pre-condition: snapshot present');
-		void removeVoiceInputProcessor();
 		this.stopLocalSpeakingDetector();
+		this.endVoiceInputRecovery();
 		this.transitionMediaState({type: 'media.reset'});
 	}
 
@@ -1389,30 +1446,6 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 			return;
 		}
 		ParticipantVolume.applySettingsToRoom(room);
-	}
-
-	applyLocalInputVolume(room: Room | null): void {
-		assertNullableObjectLike<Room>(room, 'applyLocalInputVolume.room');
-		if (!room?.localParticipant) {
-			return;
-		}
-		const audioTrack = this.getLocalAudioTrack(room);
-		updateVoiceInputGain(audioTrack);
-	}
-
-	async refreshLocalVoiceInputProcessor(room: Room | null): Promise<void> {
-		assertNullableObjectLike<Room>(room, 'refreshLocalVoiceInputProcessor.room');
-		if (!room?.localParticipant) {
-			return;
-		}
-		const audioTrack = this.getLocalAudioTrack(room);
-		await syncVoiceInputProcessor(audioTrack);
-		if (!audioTrack?.mediaStreamTrack) {
-			return;
-		}
-		const profile = resolveVoiceProcessingFromStateForDeviceLabel(VoiceSettings, this.resolveActiveInputDeviceLabel());
-		applyContentHintToTrack(audioTrack.mediaStreamTrack, profile.contentHint);
-		this.startLocalSpeakingDetector(room, audioTrack.mediaStreamTrack);
 	}
 
 	setLocalVideoDisabled(identity: string, disabled: boolean, room: Room | null, connectionId: string | null): void {
@@ -1480,7 +1513,7 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 			serverDeaf: serverVoiceState?.deaf,
 		});
 		if (isMutedOrDeafened(audioState)) return;
-		const targetMute = audioState.selfMute || !held;
+		const targetMute = getEffectiveSelfMuteForVoiceStatePayloadFromV2AudioControls();
 		const ok = this.setMicrophonePublicationsMuted(room, targetMute, 'push to talk');
 		if (!ok) {
 			this.syncVoiceState({self_mute: true});
@@ -1488,7 +1521,7 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		}
 		this.syncVoiceState({self_mute: targetMute});
 		this.updateMediaAudioControls();
-		this.syncLocalSpeakingOverride(room);
+		this.syncLocalSpeaking(room);
 	}
 
 	applyPushToMuteHold(held: boolean, room: Room | null, getCurrentUserVoiceState: () => VoiceState | null): void {
@@ -1516,7 +1549,7 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		}
 		this.syncVoiceState({self_mute: targetMute});
 		this.updateMediaAudioControls();
-		this.syncLocalSpeakingOverride(room);
+		this.syncLocalSpeaking(room);
 	}
 
 	handlePushToTalkModeChange(room: Room | null, getCurrentUserVoiceState: () => VoiceState | null): void {
@@ -1528,9 +1561,6 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		);
 		Keybind.resetPushToTalkState();
 		Keybind.resetPushToMuteState();
-		if (isPushToTalkActiveFromAppState() && LocalVoiceState.getSelfMute()) {
-			LocalVoiceState.updateSelfMute(false);
-		}
 		const serverVoiceState = getCurrentUserVoiceState();
 		const audioState = this.getEffectiveAudioState({
 			serverMute: serverVoiceState?.mute ?? false,
@@ -1545,10 +1575,7 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		}
 		this.syncVoiceState({self_mute: targetMute});
 		this.updateMediaAudioControls();
-		this.syncLocalSpeakingOverride(room);
-		void this.refreshLocalVoiceInputProcessor(room).catch((error) => {
-			logger.warn('Failed to refresh voice input processor after transmit mode change', {error});
-		});
+		this.syncLocalSpeaking(room);
 	}
 
 	getMuteReason(voiceState: VoiceState | null, guildId?: string | null, channelId?: string | null): VoiceMuteReason {
@@ -1659,13 +1686,9 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		return true;
 	}
 
-	private getLocalSpeakingOverrideState(room: Room): boolean | null {
-		if (!room.localParticipant) return false;
+	private shouldSuppressLocalSpeaking(room: Room): boolean {
 		const publication = this.getMicrophonePublication(room);
-		return resolveLocalSpeakingOverrideState({
-			pushToTalkActive: isPushToTalkActiveFromAppState(),
-			pushToMuteActive: isPushToMuteActiveFromAppState(),
-			pushToMuteHeld: Keybind.pushToMuteHeld,
+		return isLocalSpeakingSuppressed({
 			selfDeaf: LocalVoiceState.getSelfDeaf(),
 			effectiveSelfMute: getEffectiveSelfMuteForVoiceStatePayloadFromV2AudioControls(),
 			hasMicrophonePublication: Boolean(publication),
@@ -1691,186 +1714,46 @@ export class VoiceEngineV2AppMediaExecutionAdapter extends Store {
 		return selectVoiceEngineV2AppParticipant(snapshot, identity)?.isAudioLevelSpeaking ?? null;
 	}
 
-	private syncLocalSpeakingOverride(room: Room | null): void {
+	private syncLocalSpeaking(room: Room | null): void {
 		if (!room?.localParticipant) return;
-		const speaking = this.getLocalSpeakingOverrideState(room);
-		if (speaking === null) return;
-		this.speakingSilenceStartedAt = null;
+		const speaking = !this.shouldSuppressLocalSpeaking(room) && (this.localSpeakingMeter?.speaking ?? false);
 		this.setLocalParticipantAudioLevelSpeaking(room, speaking);
 	}
 
-	private startLocalSpeakingDetector(room: Room, track: MediaStreamTrack | null): void {
+	private startLocalSpeakingDetector(room: Room): void {
 		this.stopLocalSpeakingDetector(room);
-		if (!track || track.readyState === 'ended' || !room.localParticipant) {
-			return;
-		}
-		const AudioContextCtor =
-			window.AudioContext || (window as typeof window & {webkitAudioContext?: typeof AudioContext}).webkitAudioContext;
-		if (!AudioContextCtor) {
-			return;
-		}
-		try {
-			const graph = this.buildSpeakingDetectorAudioGraph(AudioContextCtor, track);
-			this.commitSpeakingDetectorGraph(graph);
-			const tick = this.createSpeakingDetectorTick({
-				room,
-				track,
-				graph,
-				getThresholdRms: () => getLocalSpeakingThresholdRms(VoiceSettings.getVadThreshold()),
-				releaseDelayMs: SPEAKING_LOCAL_RELEASE_MS,
-				localParticipantIdentity: room.localParticipant.identity,
-			});
-			this.bindSpeakingDetectorTrackEndedListener(room, track);
-			this.speakingTimerId = window.setTimeout(tick, LOCAL_SPEAKING_ANALYSER_INTERVAL_MS);
-			this.transitionMediaState({type: 'speakingDetector.attach'});
-		} catch (error) {
-			logger.warn('Failed to start local speaking detector', {error});
-			this.stopLocalSpeakingDetector(room);
-		}
-	}
-
-	private buildSpeakingDetectorAudioGraph(
-		AudioContextCtor: typeof AudioContext,
-		track: MediaStreamTrack,
-	): SpeakingDetectorGraph {
-		assert.equal(
-			typeof AudioContextCtor,
-			'function',
-			'buildSpeakingDetectorAudioGraph.AudioContextCtor must be constructor',
+		const track = this.getLocalAudioTrack(room);
+		if (!track || !room.localParticipant) return;
+		const meter = new VoiceSpeakingMeter(
+			() => track.mediaStreamTrack,
+			() => {
+				this.syncLocalSpeaking(room);
+				if (meter.speaking) noteLocalVoiceActivity(room.localParticipant, {force: true, speaking: true});
+			},
 		);
-		assertObjectLike<MediaStreamTrack>(track, 'buildSpeakingDetectorAudioGraph.track');
-		const audioContext = new AudioContextCtor({latencyHint: 'interactive'});
-		const sourceNode = audioContext.createMediaStreamSource(new MediaStream([track]));
-		const analyserNode = audioContext.createAnalyser();
-		analyserNode.fftSize = 256;
-		analyserNode.smoothingTimeConstant = 0.15;
-		sourceNode.connect(analyserNode);
-		if (audioContext.state === 'suspended') {
-			void audioContext.resume().catch((error) => {
-				logger.debug('Local speaking AudioContext resume rejected', {error});
-			});
-		}
-		const samples = new Uint8Array(analyserNode.fftSize);
-		return {audioContext, sourceNode, analyserNode, samples};
-	}
-
-	private commitSpeakingDetectorGraph(graph: SpeakingDetectorGraph): void {
-		assertObjectLike<SpeakingDetectorGraph>(graph, 'commitSpeakingDetectorGraph.graph');
-		this.speakingAudioContext = graph.audioContext;
-		this.speakingSourceNode = graph.sourceNode;
-		this.speakingAnalyserNode = graph.analyserNode;
-		this.speakingSilenceStartedAt = null;
-	}
-
-	private bindSpeakingDetectorTrackEndedListener(room: Room, track: MediaStreamTrack): void {
-		assertObjectLike<Room>(room, 'bindSpeakingDetectorTrackEndedListener.room');
-		assertObjectLike<MediaStreamTrack>(track, 'bindSpeakingDetectorTrackEndedListener.track');
-		const onTrackEnded = (): void => {
-			this.transitionMediaState({type: 'microphone.publication.ended'});
-			this.stopLocalSpeakingDetector(room);
+		const reportRuntime = (): void => {
+			const processor = readVoiceInputProcessor(track);
+			if (processor) processor.reportRuntime();
+			else this.reportRawMicrophoneRuntime(track);
 		};
-		track.addEventListener('ended', onTrackEnded, {once: true});
-		this.speakingTrackEndedCleanup = () => {
-			track.removeEventListener('ended', onTrackEnded);
+		track.on(TrackEvent.TrackProcessorUpdate, reportRuntime);
+		this.localSpeakingMeter = meter;
+		this.speakingDetectorCleanup = () => {
+			track.off(TrackEvent.TrackProcessorUpdate, reportRuntime);
+			meter.dispose();
+			NoiseSuppressionAvailability.clearVoiceInputRuntime(track);
 		};
-	}
-
-	private createSpeakingDetectorTick(options: SpeakingDetectorTickOptions): () => void {
-		assertObjectLike<SpeakingDetectorTickOptions>(options, 'createSpeakingDetectorTick.options');
-		assertNonEmptyString(
-			options.localParticipantIdentity,
-			'createSpeakingDetectorTick.options.localParticipantIdentity',
-		);
-		const setSpeaking = (speaking: boolean): void => {
-			this.setLocalParticipantAudioLevelSpeaking(options.room, speaking);
-		};
-		const tick = (): void => {
-			this.speakingTimerId = null;
-			if (this.speakingAnalyserNode !== options.graph.analyserNode) return;
-			if (options.track.readyState === 'ended') {
-				this.stopLocalSpeakingDetector(options.room);
-				return;
-			}
-			const localSpeakingOverride = this.getLocalSpeakingOverrideState(options.room);
-			if (localSpeakingOverride !== null) {
-				this.applySpeakingDetectorOverride(options, localSpeakingOverride, setSpeaking);
-				this.speakingTimerId = window.setTimeout(tick, LOCAL_SPEAKING_ANALYSER_INTERVAL_MS);
-				return;
-			}
-			this.applySpeakingDetectorSample(options, setSpeaking);
-			this.speakingTimerId = window.setTimeout(tick, LOCAL_SPEAKING_ANALYSER_INTERVAL_MS);
-		};
-		return tick;
-	}
-
-	private applySpeakingDetectorOverride(
-		options: SpeakingDetectorTickOptions,
-		localSpeakingOverride: boolean,
-		setSpeaking: (speaking: boolean) => void,
-	): void {
-		assertObjectLike<SpeakingDetectorTickOptions>(options, 'applySpeakingDetectorOverride.options');
-		assertBoolean(localSpeakingOverride, 'applySpeakingDetectorOverride.localSpeakingOverride');
-		this.speakingSilenceStartedAt = null;
-		if (this.getLocalParticipantAudioLevelSpeaking(options.localParticipantIdentity) !== localSpeakingOverride) {
-			setSpeaking(localSpeakingOverride);
-		}
-	}
-
-	private applySpeakingDetectorSample(
-		options: SpeakingDetectorTickOptions,
-		setSpeaking: (speaking: boolean) => void,
-	): void {
-		assertObjectLike<SpeakingDetectorTickOptions>(options, 'applySpeakingDetectorSample.options');
-		assert.ok(options.releaseDelayMs >= 0, 'applySpeakingDetectorSample.options.releaseDelayMs must be non-negative');
-		const {graph, releaseDelayMs, localParticipantIdentity} = options;
-		const threshold = readSpeakingDetectorThresholdRms(options.getThresholdRms);
-		graph.analyserNode.getByteTimeDomainData(graph.samples);
-		const rms = computeSpeakingDetectorRms(graph.samples);
-		const now = performance.now();
-		if (rms >= threshold) {
-			this.speakingSilenceStartedAt = null;
-			if (!this.getLocalParticipantAudioLevelSpeaking(localParticipantIdentity)) {
-				setSpeaking(true);
-			}
-			return;
-		}
-		this.speakingSilenceStartedAt ??= now;
-		if (
-			this.getLocalParticipantAudioLevelSpeaking(localParticipantIdentity) &&
-			now - this.speakingSilenceStartedAt >= releaseDelayMs
-		) {
-			setSpeaking(false);
-		}
+		reportRuntime();
+		meter.tick(performance.now());
+		this.transitionMediaState({type: 'speakingDetector.attach'});
 	}
 
 	private stopLocalSpeakingDetector(room?: Room | null): void {
 		this.transitionMediaState({type: 'speakingDetector.detach'});
-		if (this.speakingTimerId !== null) {
-			window.clearTimeout(this.speakingTimerId);
-			this.speakingTimerId = null;
-		}
-		this.speakingTrackEndedCleanup?.();
-		this.speakingTrackEndedCleanup = null;
-		try {
-			this.speakingSourceNode?.disconnect();
-		} catch (error) {
-			logger.debug('Failed to disconnect local speaking source node', {error});
-		}
-		try {
-			this.speakingAnalyserNode?.disconnect();
-		} catch (error) {
-			logger.debug('Failed to disconnect local speaking analyser node', {error});
-		}
-		void this.speakingAudioContext?.close().catch((error) => {
-			logger.debug('Failed to close local speaking AudioContext', {error});
-		});
-		this.speakingAudioContext = null;
-		this.speakingSourceNode = null;
-		this.speakingAnalyserNode = null;
-		this.speakingSilenceStartedAt = null;
-		if (room) {
-			this.setLocalParticipantAudioLevelSpeaking(room, false);
-		}
+		this.speakingDetectorCleanup?.();
+		this.speakingDetectorCleanup = null;
+		this.localSpeakingMeter = null;
+		if (room) this.setLocalParticipantAudioLevelSpeaking(room, false);
 	}
 }
 

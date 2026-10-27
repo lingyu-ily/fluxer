@@ -1,24 +1,24 @@
 # Contributing to Fluxer
 
-This policy applies to all issues, discussions, commits and pull requests.
+This policy applies to all commits and pull requests.
 
 ## Scope
 
 To prevent spam, only approved contributors may submit pull requests.
 
-To request approval, comment on an existing issue and ask to implement it. For work that extends beyond a defect fix, open a [discussion](https://github.com/orgs/fluxerapp/discussions) first.
+To request approval, comment on the [feedback.fluxer.com](https://feedback.fluxer.com) post you want to implement and ask to work on it. For work that extends beyond a defect fix, post a feature request there first.
 
 Every pull request must:
 
 - Target the repository's default branch.
-- Include a closing reference for each repository issue it resolves.
+- Link each feedback.fluxer.com post it resolves.
 - Receive approval from a maintainer before it is merged.
 
-Place each closing reference on a separate line:
+Place each link on a separate line:
 
 ```text
-Closes #123
-Closes #456
+Resolves https://feedback.fluxer.com/p/123
+Resolves https://feedback.fluxer.com/p/456
 ```
 
 ## Authorship
@@ -76,13 +76,26 @@ Complete every section of the pull request template. Clearly describe:
 - What risks it introduces.
 - How it was verified.
 
+## Build version and channel
+
+Two environment variables set the version and channel of a desktop or web build. You can leave both unset for a local build.
+
+| Variable | What it sets | Set by | When unset |
+| --- | --- | --- | --- |
+| `BUILD_VERSION` | The CalVer version (`YYYY.MDD.MICRO`) of the build. The web app shows it in its build info and `version.json`, and the desktop app uses it as its own version. | The release workflows, or `BUILD_VERSION` as a build argument when you build the app-proxy image yourself. | `dev` for the web app. A desktop package uses the version of the web app it bundles. |
+| `BUILD_CHANNEL` | `stable`, `canary` or `development`. For the desktop app it decides the app ID, data folder, link protocol and update feed. For the web app it is the channel used when the page has no channel tag. | The desktop release workflows. | `canary` for the web app and `stable` for the desktop app. |
+
+The app-proxy sets the channel of the web app when it serves the page, using its own `RELEASE_CHANNEL` setting, and the image build leaves `BUILD_CHANNEL` unset.
+
+A build stops with an error when it finds one of the old names `PUBLIC_BUILD_VERSION`, `PUBLIC_RELEASE_CHANNEL`, `RELEASE_CHANNEL` or `VERSION` without the new name.
+
 ## Reports and other contributions
 
-Use the [bug report form](https://github.com/fluxerapp/fluxer/issues/new?template=bug-report.yaml) to report reproducible defects.
+Report bugs and request features at [feedback.fluxer.com](https://feedback.fluxer.com).
 
-Report security vulnerabilities privately through the channels specified in the [security policy](https://github.com/fluxerapp/fluxer/blob/main/.github/SECURITY.md). Do not report vulnerabilities in public issues or discussions.
+Report security vulnerabilities privately through [fluxer.app/security](https://fluxer.app/security). Never post them publicly.
 
-Use [discussions](https://github.com/orgs/fluxerapp/discussions) for feature proposals and self-hosting questions.
+Read the [operator documentation](https://fluxer.dev) for self-hosting questions.
 
 Submit translations through [Weblate](https://weblate.fluxer.tools), not through pull requests.
 
